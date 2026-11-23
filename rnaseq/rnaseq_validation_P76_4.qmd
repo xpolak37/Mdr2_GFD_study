@@ -1,0 +1,1389 @@
+---
+title: "PSC mice P76_4"
+subtitle: "Validation of the P76_3 hypotheses"
+format:
+  html:
+    embed-resources: true
+    keep-md: false
+    toc: true
+    toc-expand: 3
+    toc-depth: 6
+    toc-location: left
+    number-sections: true
+    number-depth: 6
+    code-fold: show
+    code-tools: true
+    code-summary: "Open code"
+    grid:
+      body-width: 1000px
+      sidebar-width: 600px
+      margin-width: 100px
+execute:
+  warning: true
+  print: true
+  echo: true
+editor: source
+project:
+  type: default
+  output-dir: output
+fontsize: 12 px
+---
+
+# Introduction
+
+This report tests whether the main transcriptomic findings from the discovery cohort **P76_3** (PSC mouse model, liver RNA-seq, Diet × Sex design) replicate in the independent validation cohort **P76_4**. The hypotheses come from P76_3; this report uses P76_4 only to confirm or reject them.
+
+**Cohort.** P76_4 has 39 animals. One QC outlier (MID 1039) was removed, leaving 38: SD 10F/9M, GFD 10F/9M. Liver tissue was collected on two dates (11_05 and 13_05). The pipeline is the same as for P76_3:
+
+- Salmon/tximport gene counts
+- the same gene filter (non-zero count in ≥ 5 samples of at least one group), which kept 23,571 genes
+- DESeq2 with the design `~ Date + Diet * Sex`, with SD and female as reference levels
+- ashr-shrunken fold changes for gene-level LFC comparisons (H2, H6 sign concordance); unshrunk DESeq2 estimates where the comparison needs them (Wald statistic for GSEA in H4/H5, raw LFCs for the H6 magnitude tests)
+- VST expression, with genes z-scored across samples for the panel scores
+
+**Approach.** For each hypothesis, the direction of the effect, the deciding test and its tier were set from the P76_3 results before the P76_4 tests were run:
+
+- **Primary** hypotheses are the confirmatory claims. 
+- **Secondary** tests are directional supporting evidence.
+- **Exploratory** tests follow weaker P76_3 leads. 
+
+Panel-level effects come from the model `score ~ Date + Diet * Sex`. Five contrasts are computed from its model-adjusted group means: diet effect in females, diet effect in males, sex effect under SD, sex effect under GFD, and the Diet×Sex interaction. Directional hypotheses are tested one-sided. Claims of "no effect in females" use an equivalence test (TOST, margin ±0.3 z-units), because a non-significant p-value alone cannot show that an effect is absent.
+
+| ID | Hypothesis | Tier | Deciding test |
+|---|---|---|---|
+| H1 | Sex is the dominant axis of hepatic expression | primary | PERMANOVA: Sex has the largest R² and p < 0.05 |
+| H2 | The P76_3 male-diet signature (1286 genes) replicates in P76_4 males | primary | Sign concordance of male LFCs with P76_3 > 50% (binomial, one-sided) |
+| H3 | GFD masculinizes the male liver; females are unaffected | primary | masc_index: Diet×Sex interaction > 0 |
+| H4 | GFD suppresses lipogenesis/cholesterol synthesis in males only | primary | 3c lipogenesis panel: Diet×Sex interaction < 0 |
+| H5 | GFD up-regulates OXPHOS/translation and down-regulates inflammatory programs in males | secondary | Pre-specified GSEA sets, NES in the expected direction (BH over the target sets) |
+| H6 | Diet amplifies sexual dimorphism | primary | Absolute sex LFC larger on GFD than on SD across P76_3 sex-DE genes (paired Wilcoxon, one-sided) |
+| H7 | Ductular and cholestasis panels respond to diet differently in the two sexes | exploratory | Diet×Sex interaction < 0 |
+| H8 | GFD lowers fibrosis markers in males | exploratory | Fibrosis panel: GFD_M − SD_M < 0 |
+
+: Pre-specified hypotheses {#tbl-hyp tbl-colwidths="[6,44,12,38]"}
+
+# Setup
+
+## Configuration
+
+All file paths and pre-specified thresholds are defined here.
+
+```{r setup-config}
+cohort <- "P76_4"
+
+paths <- list(
+  # validation cohort (P76_4)
+  txi        = "../Results/transcript_import_P76_4.RData",   # tx2gene + txi
+  metadata   = "../../Data/metadata_P076v4.xlsx",
+  params     = "../../Data/P076_4_params.xlsx",              # AST, ALT, AlkP2, BiliT
+  # discovery cohort (P76_3) result tables written by summarise_res()
+  disc_dir      = "../Results",
+  # output
+  out_dir    = "../Results/validation_P76_4"
+)
+
+# QC outlier removed in the P76_4 report (based on the rnaseq_P76_4_part1)
+exclude_MID <- c(1039)
+
+# pre-specified thresholds
+alpha      <- 0.05   # significance level
+lfc_thr    <- 1      # |log2FC| threshold used for "significant genes" (as in P76_3)
+eq_margin  <- 0.30   # equivalence margin for panel scores (mean z-score units)
+onoff_cut  <- 10      # abs(LFC) in P76_3 above which a gene is treated as on/off
+n_perm     <- 9999   # PERMANOVA permutations
+set.seed(123)
+
+```
+
+## Libraries and helpers
+
+```{r setup-libs, message=FALSE}
+group_colours <- c("GFD_F" = "#e59866",
+                   "GFD_M" = "#7fb3d5",
+                   "SD_F"  = "#b03a2e",
+                   "SD_M"  = "#1c4c78")
+```
+
+```{r}
+source("custom_functions_rnaseq.R")
+```
+
+
+## Import
+
+```{r,eval=FALSE}
+# reading metadata
+sample_metadata <- read.xlsx(paths$metadata, detectDates = TRUE) %>%
+  dplyr::filter(!is.na(SampleID_rna)) %>%
+  dplyr::mutate(SampleID = SampleID_rna)
+
+tx2gene <- fread("../../Data/tx2gene.tsv")
+
+# Import Salmon quantifications
+files <- read.table("../../Data/samples_P76_4.txt")$V2
+files <- paste0("../../", files)
+names(files) <- sample_metadata$SampleID
+
+# txi$counts is a gene x sample matrix of estimated counts.
+txi <- tximport(
+  files,
+  type = "salmon",
+  tx2gene = tx2gene[, c("tx_id", "gene_id")],
+  ignoreTxVersion = TRUE             # handles the ".3" version suffixes
+)
+
+save(tx2gene,txi,file="../Results/transcript_import_P76_4.RData")
+```
+
+The saved `tximport` object and the P76_4 metadata are loaded. Factors are set with **SD** and **F** as reference levels.
+
+```{r}
+load(paths$txi)   # tx2gene, txi
+
+# reading metadata
+sample_metadata <- read.xlsx(paths$metadata, detectDates = TRUE) %>%
+  dplyr::filter(!is.na(SampleID_rna)) %>%
+  dplyr::mutate(SampleID = SampleID_rna)
+
+# QC exclusion based on part 1
+if (length(exclude_MID)) {
+  cat("Excluded animals (MID):", paste(exclude_MID, collapse = ", "), "\n")
+  sample_metadata <- sample_metadata %>% dplyr::filter(!(MID %in% exclude_MID))
+}
+
+# creating factors
+sample_metadata <- sample_metadata %>%
+  dplyr::mutate(
+    Diet  = factor(Diet, levels = c("SD", "GFD")),
+    Sex   = factor(Sex,  levels = c("F", "M")),
+    Group = factor(paste(Diet, Sex, sep = "_"),
+                   levels = c("SD_F", "GFD_F", "SD_M", "GFD_M")),
+    Date  = factor(gsub("-", "_", Date)),
+    Order = as.numeric(Order),
+    MID   = as.character(MID)
+  )
+
+# align txi columns to metadata rows
+all(sample_metadata$SampleID %in% colnames(txi$counts))
+
+for (nm in c("abundance", "counts", "length")) {
+  txi[[nm]] <- txi[[nm]][, sample_metadata$SampleID, drop = FALSE]
+}
+
+# turning the transcript-level annotation table into a gene-level lookup table
+# one row per gene, giving its Ensembl ID and its symbol.
+sym <- distinct(tx2gene, gene_id, gene_name)
+
+# See the number of samples in each group
+table(sample_metadata$Diet, sample_metadata$Sex)
+```
+
+## DESeq2
+
+The design, filter and contrasts are the same as in P76_3.
+
+```{r}
+dds <- DESeqDataSetFromTximport(
+  txi,
+  colData = sample_metadata,
+  design  = as.formula("~ Date + Diet * Sex")
+)
+
+# identical filter to P76_3: non-zero count in >= 5 samples of at least one group
+grp  <- sample_metadata$Group
+keep <- sapply(levels(grp), function(g) rowSums(counts(dds)[, grp == g, drop = FALSE] > 0) >= 5)
+dds  <- dds[rowSums(keep) >= 1, ]
+cat(nrow(dds), "genes kept after filtering\n")
+
+dds <- DESeq(dds)
+resultsNames(dds)
+```
+
+
+```{r}
+# Shrinking the lfc
+# lfcShrink makes the fold-change estimates more reliable. The raw log2 fold change from DESeq2 is very noisy for genes with few reads or high variability. 
+res_diet_in_F  <- lfcShrink(dds, coef = "Diet_GFD_vs_SD", type = "ashr")
+res_diet_in_M  <- lfcShrink(dds, contrast = list(c("Diet_GFD_vs_SD", "DietGFD.SexM")), type = "ashr")
+res_sex_in_SD  <- lfcShrink(dds, coef = "Sex_M_vs_F", type = "ashr")
+res_sex_in_GFD <- lfcShrink(dds, contrast = list(c("Sex_M_vs_F", "DietGFD.SexM")), type = "ashr")
+res_int        <- lfcShrink(dds, coef = "DietGFD.SexM", type = "ashr")
+
+# unshrunk Wald statistics - the number DESeq2 uses to compute each gene's p-value. 
+# It is the log2 fold change divided by its standard error
+res_diet_in_M_wald <- results(dds, contrast = list(c("Diet_GFD_vs_SD", "DietGFD.SexM")))
+res_int_wald <- results(dds, name = "DietGFD.SexM")
+
+# how many genes in a DESeq2 result table are significant
+n_sig <- function(res) sum(!is.na(res$padj) & res$padj < alpha & abs(res$log2FoldChange) >= lfc_thr)
+
+deg_counts <- tibble(
+  contrast = c("Diet effect in females", "Diet effect in males",
+               "Sex effect in SD", "Sex effect in GFD", "Diet x Sex interaction"),
+  P76_3    = c(3, 1286, 564, 6129, 75), # numbers from P76_3
+  P76_4    = c(n_sig(res_diet_in_F), n_sig(res_diet_in_M),
+               n_sig(res_sex_in_SD), n_sig(res_sex_in_GFD), n_sig(res_int))
+)
+
+ktab(deg_counts, "Significant genes (padj < 0.05, |LFC| >= 1): discovery vs validation")
+```
+
+## Expression matrix and panels
+
+The VST is computed and genes are z-scored across samples, as in P76_3. A panel score is the mean z-score of the panel genes in each sample.
+
+```{r}
+# transforms the counts.The variance-stabilizing transformation converts counts to roughly a log2 scale, where variance is about the same at all expression levels. It also normalizes for sequencing depth.
+vsd <- vst(dds, blind = FALSE) 
+m   <- assay(vsd) # extract the matrix
+z   <- t(scale(t(m))) # z-score each gene
+cd  <- as.data.frame(colData(dds)) #xtract the sample metadata
+```
+
+**Creating the panel of genes**
+
+```{r}
+panels_sym <- list(
+  `1a_male_liver`   = c("Hsd3b5","Cyp4a12a","Cyp4a12b","Cyp2d9","Cyp7b1","Slco1a1",
+                        "Elovl3","Nudt7","Ugt2b1","Bcl6"),
+  `1b_female_liver` = c("Cyp2b9","Cyp3a41a","Cyp3a44","Cyp2a4","Sult3a1","Sult2a1",
+                        "Fmo3","A1bg","Nnmt","Cux2"),
+  `1c_GH_STAT5`     = c("Ghr","Stat5b","Socs2","Cish","Igf1","Igfals","Socs3"),
+  `2_IEG_stress`    = c("Fos","Fosb","Jun","Junb","Jund","Egr1","Atf3","Dusp1",
+                        "Nr4a1","Hspa1a","Hspa1b"),
+  `3a_GC_targets`   = c("Tsc22d3","Fkbp5","Klf15","Sds","Zbtb16","Per1"),
+  `3b_fasting`      = c("Fgf21","Hmgcs2","Cpt1a","Ppargc1a","Pck1","G6pc1",
+                        "Angptl4","Slc25a20"),
+  `3c_lipogenesis`  = c("Fasn","Scd1","Elovl6","Acaca","Srebf1","Mlxipl","Hmgcs1",
+                        "Hmgcr","Sqle","Ldlr","Insig1"),
+  `4_circadian`     = c("Arntl","Npas2","Nr1d1","Nr1d2","Per1","Per2","Per3","Cry1",
+                        "Cry2","Dbp","Tef","Hlf","Nfil3","Ciart"),
+  `5_fibrosis`      = c("Col1a1","Col1a2","Col3a1","Acta2","Timp1","Timp2","Lox",
+                        "Pdgfrb","Tgfb1","Sparc"),
+  `6_ductular`      = c("Krt19","Krt7","Epcam","Sox9","Spp1","Cldn7","Hnf1b"),
+  `7_inflammation`  = c("Ccl2","Ccl5","Cxcl1","Cxcl9","Tnf","Il1b","Il6","Lcn2",
+                        "Saa1","Saa2","Adgre1","Itgam","Mmp12"),
+  `8_cholestasis`   = c("Cyp7a1","Cyp8b1","Cyp27a1","Cyp2c70","Cyp2a12","Nr0b2",
+                        "Nr1h4","Slc10a1","Abcb11","Abcc3","Abcc4","Slc51a","Slc51b",
+                        "Baat","Abcb4")
+)
+
+# "Mup family "
+mup_syms <- grep("^Mup[0-9]", sym$gene_name, value = TRUE) %>% unique()
+panels_sym[["1a_male_liver"]] <- c(panels_sym[["1a_male_liver"]], mup_syms)
+cat("Mup family notation found in :", length(mup_syms), "genes\n")
+
+# map with gene id and gene name
+sym2id <- function(s) sym$gene_id[match(s, sym$gene_name)]
+
+# QC / coverage-check step: for each gene panel
+# it counts how many of requested genes actually made it into expression data,
+# and reports which genes dropped out and why.
+coverage <- lapply(names(panels_sym), function(nm) {
+  s  <- panels_sym[[nm]]
+  id <- sym2id(s)
+  in_annot <- !is.na(id)
+  in_data  <- in_annot & id %in% rownames(m)
+  data.frame(
+    panel             = nm,
+    requested         = length(s),
+    in_data           = sum(in_data),
+    not_in_annotation = paste(s[!in_annot],            collapse = ", "),
+    filtered_lowcount = paste(s[in_annot & !in_data],  collapse = ", ")
+  )
+}) %>% dplyr::bind_rows()
+
+# case-insensitive
+missing_all <- unique(unlist(lapply(panels_sym, function(s) s[is.na(sym2id(s))])))
+if (length(missing_all)) {
+  cat("\ncase-insensitive:\n")
+  for (g in missing_all) {
+    hit <- grep(paste0("^", g, "$"), sym$gene_name, ignore.case = TRUE, value = TRUE)
+    if (length(hit)) cat(sprintf("  %-12s -> %s\n", g, paste(hit, collapse = ", ")))
+  }
+}
+
+# final panels
+panels <- lapply(panels_sym, function(s) {
+  id <- sym2id(s); unique(id[!is.na(id) & id %in% rownames(m)])
+})
+
+ktab(coverage, "Genes detected in our RNAseq dataset")
+```
+
+```{r}
+score_panels <- function(panels, zmat) {
+  sc <- sapply(panels, function(ids) colMeans(zmat[ids, , drop = FALSE], na.rm = TRUE))
+  cbind(sc, masc_index = sc[, "1a_male_liver"] - sc[, "1b_female_liver"])
+}
+scores      <- score_panels(panels, z)   # primary
+identical(rownames(scores), rownames(cd))
+```
+
+The panel models are `score ~ Date + Diet * Sex`. From the model-adjusted means of the four cells (`emmeans`), five pre-defined contrasts are computed:
+
+- `diet_in_F` = GFD_F − SD_F
+- `diet_in_M` = GFD_M − SD_M
+- `sex_in_SD` = SD_M − SD_F
+- `sex_in_GFD` = GFD_M − GFD_F
+- `interaction` = (GFD_M − SD_M) − (GFD_F − SD_F), identical to the DietGFD:SexM coefficient
+
+```{r}
+results_log <- list()
+cell_contrasts <- list(
+  diet_in_F   = c(-1,  1,  0, 0),
+  diet_in_M   = c( 0,  0, -1, 1),
+  sex_in_SD   = c(-1,  0,  1, 0),
+  sex_in_GFD  = c( 0, -1,  0, 1),
+  interaction = c( 1, -1, -1, 1)
+)
+
+score_contrasts <- function(y, cd, name, extra = "") {
+  f   <- as.formula(paste("y ~ Date + ", extra, "Diet * Sex"))
+  fit <- lm(f, data = cbind(cd, y = y))
+  emm <- emmeans(fit, ~ Diet * Sex)
+  grid <- as.data.frame(emm)
+  stopifnot(identical(paste(grid$Diet, grid$Sex), c("SD F", "GFD F", "SD M", "GFD M")))
+  out <- as.data.frame(contrast(emm, method = cell_contrasts, adjust = "none"))
+  out$panel <- name
+  out %>% dplyr::select(panel, contrast, estimate, SE, df, t.ratio, p.value)
+}
+
+all_panel_contrasts <- function(sc, cd, extra = "") {
+  bind_rows(lapply(colnames(sc), function(nm) score_contrasts(sc[, nm], cd, nm, extra)))
+}
+
+# runs the model for every panel, using the panel scores built with the P76_3 gene mapping (the primary analysis).
+pc      <- all_panel_contrasts(scores, cd)
+
+# small lookup helper. It returns the row of a contrast table for one panel and one contrast
+get_c <- function(tab, panel, contrast) tab[tab$panel == panel & tab$contrast == contrast, ]
+
+# P76_3 reference values
+# note negative interaction effect means the the effect is more negative in males than in females, positive int. means the effect is more positive in males than in females
+disc_ref <- tribble(
+  ~panel,            ~contrast,     ~P76_3,
+  "1a_male_liver",   "interaction",  0.549,
+  "1a_male_liver",   "diet_in_M",    0.590,
+  "masc_index",      "interaction",  0.399,
+  "masc_index",      "diet_in_M",    0.426,
+  "1b_female_liver", "interaction",  0.151,
+  "3c_lipogenesis",  "interaction", -1.0625,
+  "3c_lipogenesis",  "diet_in_M",   -1.123,
+  "2_IEG_stress",    "diet_in_M",   -0.7225,
+  "4_circadian",     "interaction", -0.5417,
+  "5_fibrosis",      "sex_in_SD",   -0.5109,
+  "5_fibrosis",      "diet_in_M",   -0.7565,
+  "6_ductular",      "interaction", -0.6591,
+  "8_cholestasis",   "interaction", -0.1323
+)
+```
+
+```{r}
+plot_panels <- function(sc, panel_names, title) {
+  sc <- as.data.frame(sc[, panel_names, drop = FALSE])
+  sc_long <- sc %>%
+  dplyr::mutate(Group = cd$Group, Diet = cd$Diet, Sex = cd$Sex) %>%
+  tidyr::pivot_longer(dplyr::all_of(colnames(sc)),
+                      names_to = "panel", values_to = "score") %>%
+  dplyr::mutate(panel = factor(panel, levels = colnames(sc)))
+
+pvals <- sc_long %>%
+  group_by(panel, Sex) %>%
+  summarise(p = wilcox.test(score ~ Diet)$p.value,
+            top = max(score, na.rm = TRUE),
+            rng = diff(range(score, na.rm = TRUE)),
+            .groups = "drop") %>%
+  mutate(y = top - 0 * rng,          
+         label = ifelse(p < 0.001, "***",
+                 ifelse(p < 0.01,  "**",
+                 ifelse(p < 0.05,  "*", "ns"))))
+
+
+  sc %>%
+    rownames_to_column("SampleID") %>%
+    left_join(cd %>% dplyr::select(SampleID, Diet, Sex, Group),
+              by = "SampleID") %>%
+    pivot_longer(all_of(panel_names), names_to = "panel", values_to = "score") %>%
+    dplyr::mutate(panel = factor(panel, levels = panel_names)) %>%
+    ggplot(aes(Diet, score, fill = Group)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.85) +
+    geom_jitter(width = 0.15, size = 1, alpha = 0.6) +
+        geom_text(data = pvals, aes(x = 1.5, y = y, label = label),
+            inherit.aes = FALSE, size = 4) +
+    facet_grid(panel ~ Sex, scales = "free_y", switch = "y") +
+    scale_fill_manual(values = group_colours) +
+    labs(y = "Score (mean z-score of panel)", x = NULL, title = title) +
+    theme_bw() 
+}
+```
+
+# Cohort description
+
+```{r cohort}
+ktab(as.data.frame.matrix(table(cd$Diet, cd$Sex)) %>% rownames_to_column("Diet"),
+     "Animals per Diet × Sex cell")
+```
+
+# H1: Sex is the dominant axis
+
+**Hypothesis.** Sex explains more variance in hepatic expression than Diet or Diet×Sex.
+
+**Test.** PERMANOVA on Euclidean distances of the 2,000 most variable VST genes, `~ Diet * Sex` with permutations stratified by collection date (`strata = Date`), sequential terms.
+
+Replication means that Sex has the largest R² of all terms *and* p < α.
+
+**P76_3.** Sex R² = 0.3149, p = 1e-4 (Diet 0.0595, Diet×Sex 0.05538).
+
+```{r}
+rv   <- rowVars(m)
+top  <- order(rv, decreasing = TRUE)[seq_len(min(2000, length(rv)))]
+mat  <- t(m[top, ])
+meta <- cd[rownames(mat), ]
+d    <- dist(mat)
+
+bd <- betadisper(d, meta$Group)
+ktab(as.data.frame(anova(bd)), "Dispersion homogeneity (betadisper)")
+
+pmv <- adonis2(as.formula("d ~ Diet * Sex"),
+               data = meta, 
+               by = "terms", 
+               permutations = n_perm,
+               strata=meta$Date)
+
+ktab(as.data.frame(pmv), "PERMANOVA (strata=Date): Diet * Sex")
+
+terms_r2  <- pmv$R2[!rownames(pmv) %in% c("Residual", "Total")]
+names(terms_r2) <- rownames(pmv)[!rownames(pmv) %in% c("Residual", "Total")]
+sex_top   <- names(which.max(terms_r2)) == "Sex"
+
+log_result("H1", "primary", 
+           "Sex = dominant axis (PERMANOVA Sex R²)", "adonis2, Sex term",
+           "-", "-", 
+           estimate = pmv["Sex", "R2"], 
+           p = pmv["Sex", "Pr(>F)"], 
+           disc = 0.3149,
+           note = paste("Sex has largest R²:", sex_top))
+
+log_result("H2", "secondary", 
+           "Diet×Sex interaction on global profile (PERMANOVA R²)",
+           "adonis2, Diet:Sex term", 
+           "-", "-",
+           estimate = pmv["Diet:Sex", "R2"], 
+           p = pmv["Diet:Sex", "Pr(>F)"], 
+           disc = 0.0554)
+```
+
+```{r}
+bind_rows(results_log) %>%
+  dplyr::filter(id == "H1") %>%
+  ktab("H1: hypothesis test Sex = dominant axis (PERMANOVA Sex R²)")
+```
+
+## Visualization
+
+```{r, fig.width=10, fig.height=4}
+pca <- prcomp(mat)
+pv  <- round(100 * pca$sdev^2 / sum(pca$sdev^2), 1)
+pca_df <- as.data.frame(pca$x[, 1:3]) %>% bind_cols(meta[, c("Group", "Sex", "Diet", "Date")])
+
+p12 <- ggplot(pca_df, aes(PC1, PC2, colour = Group)) +
+  geom_point(size = 3) + scale_colour_manual(values = group_colours) +
+  labs(x = paste0("PC1: ", pv[1], "%"), y = paste0("PC2: ", pv[2], "%")) + 
+  theme_bw()
+
+p13 <- ggplot(pca_df, aes(PC1, PC3, colour = Group)) +
+  geom_point(size = 3) + scale_colour_manual(values = group_colours) +
+  labs(x = paste0("PC1: ", pv[1], "%"), y = paste0("PC3: ", pv[3], "%")) + 
+  theme_bw()
+
+p12 + p13 + plot_layout(guides = "collect")
+```
+
+# H2: Replication of the male diet signature
+
+**Hypothesis.** The P76_3 male-diet signature (1286 genes, padj < 0.05, |LFC| ≥ 1) reproduces in P76_4 males.
+
+**Tests.**
+
+ - *Primary:* the GFD-vs-SD log2FC in P76_4 males agrees in sign with P76_3 for more than 50% of the genes (binomial, one-sided).
+ - *Secondary:* the P76_3 and P76_4 male LFCs correlate positively (Spearman, one-sided, rho > 0).
+ - *Secondary:* Diet×Sex term of the global PERMANOVA (section H1), p < 0.05.
+   
+```{r}
+disc_M <- read.xlsx(file.path(paths$disc_dir, "Diet effect in males.xlsx"))
+cat("P76_3 male-diet genes:", nrow(disc_M), "\n")
+
+# builds a comparison table with one row per P76_3 male-diet gene.
+cmp <- disc_M %>%
+  dplyr::select(gene_id, gene_name, lfc_disc = log2FoldChange) %>%
+  inner_join(res_to_df(res_diet_in_M) %>% 
+               dplyr::select(gene_id, lfc_M = log2FoldChange, padj_M = padj),
+             by = "gene_id") %>%
+  inner_join(res_to_df(res_diet_in_F) %>% 
+               dplyr::select(gene_id, lfc_F = log2FoldChange),
+             by = "gene_id") %>%
+  dplyr::mutate(onoff = abs(lfc_disc) >= onoff_cut)
+
+cat("Found in P76_4 after filtering:", nrow(cmp), "of", nrow(disc_M), "\n")
+
+head(cmp)
+```
+
+```{r}
+signature_tests <- function(df, label) {
+  s   <- sign(df$lfc_disc) # direction
+  
+  # the number of genes whose P76_4 male LFC points the same way as in P76_3 males. Male
+  # vs male: "does the male effect replicate?"
+  kM  <- sum(sign(df$lfc_M) == s) 
+  
+  n <- nrow(df)
+  
+  # could this many genes agree with P76_3 just by luck?
+  bM  <- binom.test(kM, n, 0.5, alternative = "greater")
+  
+  # correlation
+  ct  <- suppressWarnings(
+    cor.test(df$lfc_disc, 
+             df$lfc_M, 
+             method = "spearman", 
+             alternative = "greater"))
+  
+  tibble(set = label, # Which genes were used
+         n_genes = n, # Number of P76_3 genes also found in P76_4
+         concord_M = kM / n, # Fraction of genes whose P76_4 male LFC has the same sign as in P76_3
+         p_concord_M = bM$p.value, # One-sided binomial test that concord_M > 0.5
+         rho_M = unname(ct$estimate), # Spearman correlation between P76_3 LFC and P76_4 male LFC
+         p_rho_M = ct$p.value) # 	One-sided test that rho_M > 0
+}
+
+h2_tab <- signature_tests(
+  cmp, "all P76_3 male-diet genes")
+
+ktab(h2_tab, "H2: gene-level replication of the P76_3 male-diet signature")
+
+log_result("H2",
+           "primary",
+           "Sign concordance of male diet LFC",
+           "binomial, one-sided",
+           "dir", ">0.5",
+           estimate = h2_tab$concord_M[1],
+           p = h2_tab$p_concord_M[1])
+
+log_result("H2",
+           "secondary",
+           "LFC correlation P76_3 vs P76_4 (males)",
+           "Spearman, one-sided",
+           "dir", ">0",
+           estimate = h2_tab$rho_M[1], p = h2_tab$p_rho_M[1])
+```
+
+```{r}
+bind_rows(results_log) %>%
+  dplyr::filter(id == "H2") %>%
+  ktab("H2: Replication of the P76_3 male diet signature")
+```
+
+## Visualization
+
+```{r, fig.width=6, fig.height=5}
+tol <- 1  
+
+cmp_plot <- cmp %>%
+  dplyr::mutate(
+    agreement = dplyr::case_when(
+      abs(lfc_M - lfc_disc) <= tol          ~ "same effect (within ± 1)",
+      sign(lfc_M) == sign(lfc_disc)         ~ "same direction, different size",
+      TRUE                                  ~ "opposite direction"
+    ),
+    agreement = factor(agreement, levels = c("same effect (within ± 1)",
+                                             "same direction, different size",
+                                             "opposite direction"))
+  )
+
+# counts in the legend
+n_tab  <- table(cmp_plot$agreement)
+labs_n <- paste0(names(n_tab), " (n = ", n_tab, ")")
+
+ggplot(cmp_plot, aes(lfc_disc, lfc_M)) +
+  # shaded "same effect" band around y = x
+  annotate("polygon",
+           x = c(-10, 10, 10, -10),
+           y = c(-10 - tol, 10 - tol, 10 + tol, -10 + tol),
+           fill = "grey85", alpha = 0.5) +
+  geom_hline(yintercept = 0, colour = "grey60") +
+  geom_vline(xintercept = 0, colour = "grey60") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey40") +
+  geom_point(aes(colour = agreement), alpha = 0.7, size = 1.8) +
+  scale_colour_manual(values = c("same effect (within ±tol)"      = "#1f6fb2",
+                                 "same direction, different size" = "grey50",
+                                 "opposite direction"             = "#d9731a"),
+                      labels = labs_n, name = NULL, drop = FALSE) +
+  labs(x = "log2FC GFD vs SD in males, P76_3",
+       y = "log2FC GFD vs SD in males, P76_4",
+       title = "P76_3 male-diet genes") +
+  theme_bw() +
+  theme(legend.position = "right") +
+  coord_cartesian(xlim = c(-10, 10), ylim = c(-10, 10))
+```
+
+```{r}
+# ---- settings ----
+xlim_val <- 4
+ylim_val <- 2
+# tol is assumed to be defined already (e.g. tol <- 1)
+
+# ---- categories and statistics ----
+lvls <- c("same effect (within ± 1)",
+          "same direction, different size",
+          "opposite direction")
+
+cmp_plot <- cmp_plot %>%
+  mutate(agreement = factor(agreement, levels = lvls))
+
+n_genes <- nrow(cmp_plot)
+pct     <- round(100 * prop.table(table(cmp_plot$agreement)))
+rho     <- cor(cmp_plot$lfc_disc, cmp_plot$lfc_M, method = "spearman")
+
+agr_labels <- c(
+  "same effect (within ± 1)"      = paste0("same direction, |Δlog2FC| ≤ ", tol, " (", pct[1], " %)"),
+  "same direction, different size" = paste0("same direction, |Δlog2FC| > ", tol, " (", pct[2], " %)"),
+  "opposite direction"             = paste0("opposite direction (", pct[3], " %)")
+)
+
+stat_label <- paste0("\u03C1 = ", sprintf("%.2f", rho), ", ",
+                     format(n_genes, big.mark = " "), " genes")
+
+# how many points fall outside the displayed range
+sum(abs(cmp_plot$lfc_disc) > xlim_val)
+sum(abs(cmp_plot$lfc_M)    > ylim_val)
+
+# ---- plot ----
+f_5f <- ggplot(cmp_plot, aes(lfc_disc, lfc_M)) +
+  # ±tol band around y = x
+  annotate("polygon",
+           x = c(-xlim_val, xlim_val, xlim_val, -xlim_val),
+           y = c(-xlim_val - tol, xlim_val - tol, xlim_val + tol, -xlim_val + tol),
+           fill = "grey90") +
+  geom_hline(yintercept = 0, colour = "grey60", linewidth = 0.3) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              colour = "grey50", linewidth = 0.3) +
+  geom_point(aes(colour = agreement), size = 0.7, alpha = 0.8) +
+  scale_colour_manual(values = c("same effect (within ± 1)"      = "#2C5F9E",
+                                 "same direction, different size" = "#9DC3E6",
+                                 "opposite direction"             = "#E07B28"),
+                      labels = agr_labels, name = NULL, drop = FALSE) +
+  annotate("text", x = -xlim_val + 0.15, y = ylim_val * 0.9, label = stat_label,
+           hjust = 0, size = 2.6) +
+  guides(colour = guide_legend(override.aes = list(size = 1.5, alpha = 1))) +
+  coord_cartesian(xlim = c(-xlim_val, xlim_val),
+                  ylim = c(-ylim_val, ylim_val), expand = FALSE) +
+  labs(x = "log2FC males, exploratory cohort", y = "log2FC males, validation cohort",
+       title = "Replication of the male diet signature") +
+  theme_classic(base_size = 10) +
+  theme(
+    legend.position      = c(0.70, 0.15),
+    legend.justification   = c(0, 1),
+    legend.text            = element_text(size = 6.5),
+    legend.key.size        = unit(0.3, "cm"),
+    legend.background      = element_rect(fill = "white", colour = "grey50", linewidth = 0.3),
+    legend.margin          = margin(3, 5, 3, 3),
+    plot.title             = element_text(size = 10, face = "plain"),
+    plot.tag               = element_text(size = 14, face = "bold"),
+    axis.text              = element_text(colour = "black", size = 8),
+    axis.line              = element_line(linewidth = 0.4),
+    axis.ticks             = element_line(linewidth = 0.4)
+  )
+
+f_5f
+  
+save(f_5f,file = "../Results/figures/F5F.RData")
+```
+
+# H3: GFD hyper-masculinizes the male liver
+
+**Hypothesis.** Under GFD, the male-liver program (1a) and the masculinization index increase in males only.
+
+**Tests.**
+
+- *Primary:* masc_index interaction > 0 (one-sided).
+- *Secondary:* 1a panel interaction > 0 (one-sided).
+- *Secondary:* GFD_M − SD_M (Diet in M) > 0 for both scores.
+- *Secondary:* female diet effect equivalent to 0 (TOST, ± `eq_margin`).
+
+**P76_3.** 
+
+- 1a interaction +0.549 (padj 0.0006)
+- masc_index interaction +0.399 (padj  0.008)
+- no female effect (0.0407; padj 0.670)
+
+```{r}
+# Male liver panel
+h3 <- pc %>% 
+  dplyr::filter(
+    panel %in% c("1a_male_liver", "1b_female_liver", "1c_GH_STAT5", "masc_index")) %>%
+  left_join(disc_ref, by = c("panel", "contrast"))
+
+ktab(h3, "H3: sex-program panel contrasts (P76_3 panel mapping)")
+
+r <- get_c(pc, "1a_male_liver", "interaction")
+
+log_result("H3", "secondary", 
+           "1a male-liver: Diet×Sex interaction", 
+           "lm + emmeans, one-sided",
+           "dir", ">0", 
+           estimate = r$estimate,
+           p = p_dir(r$t.ratio, r$df, +1), 
+           disc =  disc_ref$P76_3[(disc_ref$panel == "1a_male_liver") & disc_ref$contrast == "interaction"])
+
+# Masc index 
+r <- get_c(pc, "masc_index", "interaction")
+
+log_result("H3", "primary", 
+           "masc_index: Diet×Sex interaction", 
+           "lm + emmeans, one-sided",
+           "dir", ">0", 
+           estimate = r$estimate,
+           p = p_dir(r$t.ratio, r$df, +1), 
+           disc = disc_ref$P76_3[(disc_ref$panel == "masc_index") & disc_ref$contrast == "interaction"])
+
+for (pn in c("1a_male_liver", "masc_index")) {
+  r <- get_c(pc, pn, "diet_in_M")
+  log_result("H3", "secondary", 
+             paste0(pn, ": GFD_M − SD_M"), 
+             "lm + emmeans, one-sided",
+             "dir", ">0", 
+             estimate = r$estimate, 
+             p = p_dir(r$t.ratio, r$df, +1),
+             disc = disc_ref$P76_3[(disc_ref$panel == pn) & disc_ref$contrast == "diet_in_M"])
+  
+  r <- get_c(pc, pn, "diet_in_F")
+  log_result("H3", "secondary", 
+             paste0(pn, ": no diet effect in females"),
+             paste0("TOST ±", eq_margin), "tost", "≈0",
+             estimate = r$estimate, 
+             # calculate TOST based on estimate, SE and df +- eq_margin
+             p = p_tost(r$estimate, r$SE, r$df, eq_margin))
+}
+```
+
+```{r}
+bind_rows(results_log) %>%
+  dplyr::filter(id == "H3") %>%
+  ktab("H3: GFD hyper-masculinizes the male liver")
+```
+
+## Visualization
+
+```{r h3-plot, fig.width=6, fig.height=8}
+plot_panels(scores, 
+            c("1a_male_liver", "1b_female_liver", "1c_GH_STAT5", "masc_index"),
+            "Sex-specific liver programs")
+```
+
+```{r}
+sc <- scores
+panel_names <- c("1a_male_liver", "1b_female_liver", "1c_GH_STAT5", "masc_index")
+
+sc <- as.data.frame(sc[, panel_names, drop = FALSE])
+
+sc_long <- sc %>%
+  dplyr::mutate(Group = cd$Group, Diet = cd$Diet, Sex = cd$Sex) %>%
+  tidyr::pivot_longer(dplyr::all_of(colnames(sc)),
+                      names_to = "panel", values_to = "score") %>%
+  dplyr::mutate(panel = factor(panel, levels = colnames(sc)))
+
+pvals <- sc_long %>%
+  group_by(panel, Sex) %>%
+  summarise(p = wilcox.test(score ~ Diet)$p.value,
+            top = max(score, na.rm = TRUE),
+            rng = diff(range(score, na.rm = TRUE)),
+            .groups = "drop") %>%
+  mutate(y = top - 0 * rng,          
+         label = ifelse(p < 0.001, "***",
+                 ifelse(p < 0.01,  "**",
+                 ifelse(p < 0.05,  "*", "ns"))))
+
+save(sc_long,pvals,file="../Results/figures/F5C_data_validation.RData")
+```
+
+
+# H4: GFD suppresses lipogenesis/cholesterol-synthesis in males
+
+**Hypothesis.** The lipogenesis/cholesterol-synthesis program (3c) falls under GFD in males only.
+
+**Tests.**
+
+- *Primary:* 3c interaction < 0 (one-sided).
+- *Secondary:* GFD_M − SD_M < 0 (one-sided).
+- *Secondary:* female diet effect equivalent to 0 (TOST, ± `eq_margin`).
+- *Secondary:* cholesterol-homeostasis and SREBP gene sets are negatively enriched in the male diet ranking (tested together with H5 in the GSEA section below).
+
+**P76_3.**
+
+- 3c interaction −1.0625 (padj 0.00928)
+- GFD_M − SD_M = −1.123
+- HALLMARK_CHOLESTEROL_HOMEOSTASIS NES = −2.78
+- REACTOME_ACTIVATION_OF_GENE_EXPRESSION_BY_SREBF_SREBP NES = −2.60
+- REACTOME_REGULATION_OF_CHOLESTEROL_BIOSYNTHESIS_BY_SREBP_SREBF NES = −2.65
+
+```{r h4}
+h4 <- pc %>% 
+  dplyr::filter(panel %in% c("2_IEG_stress", 
+                             "3a_GC_targets", 
+                             "3b_fasting", "3c_lipogenesis")) %>%
+  left_join(disc_ref, by = c("panel", "contrast"))
+
+ktab(h4, "H4: metabolic panel contrasts (P76_3 panel mapping)")
+
+r <- get_c(pc, "3c_lipogenesis", "interaction")
+
+log_result("H4", "primary", 
+           "3c lipogenesis: Diet×Sex interaction", "lm + emmeans, one-sided",
+           "dir", "<0", 
+           estimate = r$estimate, 
+           p = p_dir(r$t.ratio, r$df, -1), 
+           disc = disc_ref$P76_3[(disc_ref$panel == "3c_lipogenesis") & disc_ref$contrast == "interaction"])
+
+r <- get_c(pc, "3c_lipogenesis", "diet_in_M")
+log_result("H4", "secondary", 
+           "3c lipogenesis: GFD_M − SD_M", "lm + emmeans, one-sided",
+           "dir", "<0", 
+           estimate = r$estimate, 
+           p = p_dir(r$t.ratio, r$df, -1), 
+           disc = disc_ref$P76_3[(disc_ref$panel == "3c_lipogenesis") & disc_ref$contrast == "diet_in_M"])
+
+r <- get_c(pc, "3c_lipogenesis", "diet_in_F")
+log_result("H4", "secondary", 
+           "3c lipogenesis: no diet effect in females",
+           paste0("TOST ±", eq_margin), 
+           "tost", "≈0",
+           estimate = r$estimate, 
+           disc = -0.0598,
+           p = p_tost(r$estimate, r$SE, r$df, eq_margin))
+
+```
+
+```{r}
+bind_rows(results_log) %>%
+  dplyr::filter(id == "H4") %>%
+  ktab("H4: GFD suppresses lipogenesis/cholesterol synthesis in males (panel tests)")
+```
+
+### Visualization
+
+```{r h4-plot, fig.width=6, fig.height=8}
+plot_panels(scores, c("2_IEG_stress", "3a_GC_targets", "3b_fasting", "3c_lipogenesis"),
+            "Metabolic / feeding-state programs")
+```
+
+```{r}
+sc <- scores
+panel_names <- c("2_IEG_stress", "3a_GC_targets", "3b_fasting", "3c_lipogenesis")
+
+sc <- as.data.frame(sc[, panel_names, drop = FALSE])
+
+sc_long <- sc %>%
+  dplyr::mutate(Group = cd$Group, Diet = cd$Diet, Sex = cd$Sex) %>%
+  tidyr::pivot_longer(dplyr::all_of(colnames(sc)),
+                      names_to = "panel", values_to = "score") %>%
+  dplyr::mutate(panel = factor(panel, levels = colnames(sc)))
+
+pvals <- sc_long %>%
+  group_by(panel, Sex) %>%
+  summarise(p = wilcox.test(score ~ Diet)$p.value,
+            top = max(score, na.rm = TRUE),
+            rng = diff(range(score, na.rm = TRUE)),
+            .groups = "drop") %>%
+  mutate(y = top - 0 * rng,          
+         label = ifelse(p < 0.001, "***",
+                 ifelse(p < 0.01,  "**",
+                 ifelse(p < 0.05,  "*", "ns"))))
+
+save(sc_long,pvals,file="../Results/figures/F5D_data_validation.RData")
+```
+
+# H5: GFD up-regulates OXPHOS and translation and down-regulates inflammatory programs in males
+
+**Hypothesis.** In the male diet contrast, OXPHOS, respiratory electron transport and ribosome sets are positively enriched, and TNFα/NF-κB, inflammatory response and IFN-γ sets are negatively enriched. The three cholesterol/SREBP sets of H4 are tested in the same run.
+
+**Test.**
+
+- fgsea on the **9 pre-specified sets only**, with BH correction across those sets. The deciding ranking is the Wald statistic of the unshrunk **diet-in-males** contrast, as in P76_3. The interaction ranking is shown for comparison only.
+
+-> Replication means the NES is in the expected direction and padj < α.
+
+**P76_3** (male diet ranking). OXPHOS NES = 3.25, respiratory electron transport 3.33, KEGG ribosome 3.28, TNFα/NF-κB −2.43, inflammatory response −2.04, IFN-γ response −1.72.
+
+```{r}
+get_sets <- function(coll, subcoll = NULL) {
+  out <- tryCatch(
+    msigdbr(species = "Mus musculus", 
+            collection = coll, subcollection = subcoll),
+    error = function(e) msigdbr(species = "Mus musculus", 
+                                category = coll, 
+                                subcategory = subcoll)
+  )
+  split(out$gene_symbol, out$gs_name)
+}
+
+all_sets <- c(get_sets("H"),
+              tryCatch(get_sets("C2", "CP:KEGG_LEGACY"), 
+                       error = function(e) get_sets("C2", "CP:KEGG")),
+              get_sets("C2", "CP:REACTOME"))
+
+gsea_expect <- tribble(
+  ~pathway,                                                        ~hyp, ~expected,
+  "HALLMARK_OXIDATIVE_PHOSPHORYLATION",                            "H5",  1,
+  "REACTOME_RESPIRATORY_ELECTRON_TRANSPORT",                       "H5",  1,
+  "KEGG_RIBOSOME",                                                 "H5",  1,
+  "HALLMARK_TNFA_SIGNALING_VIA_NFKB",                              "H5", -1,
+  "HALLMARK_INFLAMMATORY_RESPONSE",                                "H5", -1,
+  "HALLMARK_INTERFERON_GAMMA_RESPONSE",                            "H5", -1,
+  "HALLMARK_CHOLESTEROL_HOMEOSTASIS",                              "H4", -1,
+  "REACTOME_ACTIVATION_OF_GENE_EXPRESSION_BY_SREBF_SREBP",         "H4", -1,
+  "REACTOME_REGULATION_OF_CHOLESTEROL_BIOSYNTHESIS_BY_SREBP_SREBF","H4", -1
+)
+
+missing_sets <- setdiff(gsea_expect$pathway, names(all_sets))
+
+if (length(missing_sets)) warning("Gene sets not found: ", paste(missing_sets, collapse = ", "))
+target_sets <- all_sets[intersect(gsea_expect$pathway, names(all_sets))]
+```
+
+```{r}
+# one value per gene symbol (the one with the largest |value|)
+make_ranks <- function(res, col = "stat") {
+  df <- res_to_df(res) %>%
+    dplyr::filter(!is.na(gene_name), gene_name != "", !is.na(.data[[col]])) %>%
+    group_by(gene_name) %>% slice_max(abs(.data[[col]]), n = 1, with_ties = FALSE) %>% ungroup()
+  sort(setNames(df[[col]], df$gene_name), decreasing = TRUE)
+}
+
+
+run_targeted_gsea <- function(ranks, label) {
+  set.seed(123)
+  fgsea(target_sets, ranks, minSize = 10, maxSize = 500, eps = 0) %>%
+    as_tibble() %>%
+    dplyr::select(pathway,  pval, padj,log2err,ES, NES, size, leadingEdge) %>%
+    dplyr::mutate(ranking = label)
+}
+
+gsea_tab <- bind_rows(
+  run_targeted_gsea(make_ranks(res_diet_in_M_wald, col = "stat"), "male diet, Wald stat (secondary)"),
+  run_targeted_gsea(make_ranks(res_int_wald,       col = "stat"), "interaction, Wald stat")) %>%
+  left_join(gsea_expect, by = "pathway") %>%
+  dplyr::mutate(direction_ok = sign(NES) == expected,
+                replicated   = direction_ok & padj < alpha) %>%
+  dplyr::arrange(ranking, hyp, pathway)
+
+ktab(gsea_tab, "H4/H5: targeted GSEA")
+
+prim <- dplyr::filter(
+  gsea_tab, 
+  ranking == "male diet, Wald stat (secondary)")
+
+for (i in seq_len(nrow(prim))) {
+  log_result(prim$hyp[i], "secondary", 
+             paste("GSEA", prim$pathway[i]), "fgsea, BH over target sets",
+             "dir", ifelse(prim$expected[i] > 0, ">0", "<0"),
+             estimate = prim$NES[i],
+             p = ifelse(prim$direction_ok[i], prim$padj[i], 1))
+}
+```
+
+```{r}
+write.xlsx(gsea_tab,"../Results/validation_P76_4/gsea_results.xlsx")
+```
+
+### Results
+
+```{r}
+bind_rows(results_log) %>%
+  dplyr::filter(id == "H4" & grepl("fgsea",test)) %>%
+  ktab("H4: cholesterol/SREBP gene sets in the male diet ranking")
+```
+
+```{r}
+bind_rows(results_log) %>%
+  dplyr::filter(id == "H5") %>%
+  ktab("H5: OXPHOS/translation up and inflammatory programs down in GFD males")
+```
+
+# H6: Diet amplifies sexual dimorphism
+
+**Hypothesis.** GFD widens the male–female difference in hepatic expression, and the change is carried by the male diet response. In P76_3, 564 genes were sex-DE under SD and 6129 under GFD.
+
+**Tests.** The gene set for tests 1 and 2 is the union of P76_3 sex-DE genes (SD or GFD).
+
+1. *Amplification (deciding test):* |sex LFC on GFD| > |sex LFC on SD| (paired Wilcoxon, one-sided).
+2. *Carried by males:* |diet LFC in males| > |diet LFC in females| (paired Wilcoxon, one-sided). Because (sex on GFD − sex on SD) = (diet in males − diet in females), this asks which sex the change in dimorphism comes from.
+3. *Agreement with P76_3:* the sign of the sex LFC on GFD agrees with P76_3 for more than 50% of the P76_3 "Sex effect in GFD" genes (binomial, one-sided, analogous to H2).
+
+Tests 1 and 2 use **unshrunk** DESeq2 LFCs. ashr fits its prior separately for each contrast, so a contrast with little genome-wide signal (diet in females: 0 DEGs) is shrunk towards 0 almost everywhere, which would bias a magnitude comparison between contrasts. The four contrasts have similar standard errors (cells of 10/9 animals), so the raw LFCs are comparable. Test 3 uses only the sign, so the shrunk LFCs are used there.
+
+```{r}
+# P76_3 sex-DE gene tables (written by summarise_res())
+disc_sex_SD  <- read.xlsx(file.path(paths$disc_dir, "Sex effect in SD.xlsx"))
+disc_sex_GFD <- read.xlsx(file.path(paths$disc_dir, "Sex effect in GFD.xlsx"))
+
+# gene set for tests 1 and 2: union of P76_3 sex-DE genes (SD or GFD)
+disc_sex <- bind_rows(
+  disc_sex_SD  %>% dplyr::select(gene_id, gene_name) %>% dplyr::mutate(source = "SD"),
+  disc_sex_GFD %>% dplyr::select(gene_id, gene_name) %>% dplyr::mutate(source = "GFD")
+) %>%
+  dplyr::group_by(gene_id, gene_name) %>%
+  dplyr::summarise(source = paste(sort(unique(source)), collapse = "+"), .groups = "drop")
+
+# P76_4 ashr-shrunk LFCs for the four simple contrasts (used for the sign test, test 3)
+lfc4 <-res_to_df(res_sex_in_SD)  %>% 
+  dplyr::select(gene_id, sex_SD  = log2FoldChange) %>%
+  inner_join(res_to_df(res_sex_in_GFD) %>% dplyr::select(gene_id, sex_GFD = log2FoldChange), by = "gene_id") %>%
+  inner_join(res_to_df(res_diet_in_M)  %>% dplyr::select(gene_id, diet_M  = log2FoldChange), by = "gene_id") %>%
+  inner_join(res_to_df(res_diet_in_F)  %>% dplyr::select(gene_id, diet_F  = log2FoldChange), by = "gene_id")
+
+# P76_4 unshrunk LFCs for the same contrasts (used for the magnitude tests, tests 1 and 2)
+raw <- function(...) res_to_df(results(dds, ...))
+lfc4_raw <- raw(name = "Sex_M_vs_F") %>% dplyr::select(gene_id, sex_SD = log2FoldChange) %>%
+  inner_join(raw(contrast = list(c("Sex_M_vs_F", "DietGFD.SexM"))) %>% dplyr::select(gene_id, sex_GFD = log2FoldChange), by = "gene_id") %>%
+  inner_join(raw(contrast = list(c("Diet_GFD_vs_SD", "DietGFD.SexM"))) %>% dplyr::select(gene_id, diet_M = log2FoldChange), by = "gene_id") %>%
+  inner_join(raw(name = "Diet_GFD_vs_SD") %>% dplyr::select(gene_id, diet_F = log2FoldChange), by = "gene_id")
+
+dimorph <- disc_sex %>%
+  inner_join(lfc4_raw, by = "gene_id") %>%
+  dplyr::filter(if_all(c(sex_SD, sex_GFD, diet_M, diet_F), ~ !is.na(.x)))
+
+cat("P76_3 sex-DE genes (union):", nrow(disc_sex),
+    "| found in P76_4:", nrow(dimorph), "\n")
+
+```
+
+```{r}
+# paired one-sided Wilcoxon: is a > b?
+paired_greater <- function(a, b, label) {
+  wt <- wilcox.test(a, b, paired = TRUE, alternative = "greater",
+                    conf.int = TRUE, exact = FALSE)
+  tibble(test          = label,
+         n_genes       = length(a),
+         median_a      = median(a),
+         median_b      = median(b),
+         pseudo_median = unname(wt$estimate),   # Hodges-Lehmann of a - b
+         frac_a_gt_b   = mean(a > b),
+         p             = wt$p.value)
+}
+
+# Test 1 - amplification: |sex LFC on GFD| > |sex LFC on SD|
+t1 <- paired_greater(abs(dimorph$sex_GFD), abs(dimorph$sex_SD),
+                     "abs(sex LFC GFD) > abs(sex LFC SD)")
+
+# Test 2 - carried by males: |diet LFC in males| > |diet LFC in females|
+t2 <- paired_greater(abs(dimorph$diet_M), abs(dimorph$diet_F),
+                     "abs(diet LFC M) > abs(diet LFC F)")
+
+# Test 3 - agreement with discovery: sign of sex LFC on GFD, P76_4 vs P76_3
+# (analogous to H2; gene set = P76_3 "Sex effect in GFD" genes)
+cmp_sexGFD <- disc_sex_GFD %>%
+  dplyr::select(gene_id, gene_name, lfc_disc = log2FoldChange) %>%
+  inner_join(lfc4 %>% dplyr::select(gene_id, lfc_val = sex_GFD), by = "gene_id") %>%
+  dplyr::filter(!is.na(lfc_val))
+
+k_conc <- sum(sign(cmp_sexGFD$lfc_val) == sign(cmp_sexGFD$lfc_disc))
+n_conc <- nrow(cmp_sexGFD)
+b3     <- binom.test(k_conc, n_conc, 0.5, alternative = "greater")
+rho3   <- suppressWarnings(cor.test(cmp_sexGFD$lfc_disc, cmp_sexGFD$lfc_val,
+                                    method = "spearman", alternative = "greater"))
+
+t3 <- tibble(test = "sign concordance, sex LFC on GFD (P76_4 vs P76_3)",
+             n_genes = n_conc, concordance = k_conc / n_conc, p = b3$p.value,
+             rho = unname(rho3$estimate), p_rho = rho3$p.value)
+
+ktab(bind_rows(t1, t2), "H6: paired Wilcoxon tests (one-sided)")
+ktab(t3, "H6: sign concordance with P76_3 (binomial, one-sided)")
+```
+
+### Results
+
+```{r}
+log_result("H6", "primary",
+           "Amplification: abs(sex LFC GFD) > abs(sex LFC SD) (P76_3 sex-DE genes)",
+           "paired Wilcoxon, one-sided", "dir", ">0",
+           estimate = t1$pseudo_median, p = t1$p,
+           note = sprintf("n = %d; %.0f%% genes larger on GFD",
+                          t1$n_genes, 100 * t1$frac_a_gt_b))
+
+log_result("H6", "secondary",
+           "Carried by males: abs(diet LFC M) > abs(diet LFC F) (P76_3 sex-DE genes)",
+           "paired Wilcoxon, one-sided", "dir", ">0",
+           estimate = t2$pseudo_median, p = t2$p,
+           note = sprintf("n = %d; %.0f%% genes larger in males",
+                          t2$n_genes, 100 * t2$frac_a_gt_b))
+
+log_result("H6", "secondary",
+           "Agreement with P76_3: sign of sex LFC on GFD",
+           "binomial, one-sided", "dir", ">0.5",
+           estimate = t3$concordance, p = t3$p,
+           note = sprintf("n = %d; Spearman rho = %.2f (p = %.2g)",
+                          t3$n_genes, t3$rho, t3$p_rho))
+
+bind_rows(results_log) %>%
+  dplyr::filter(id == "H6") %>%
+  ktab("H6: Diet amplifies sexual dimorphism")
+```
+
+## Visualization
+
+```{r,fig.height=4, fig.width=15}
+# Visualization
+p_amp <- ggplot(dimorph, aes(abs(sex_SD), abs(sex_GFD))) +
+  geom_abline(linetype = "dashed", colour = "grey40") +
+  geom_point(alpha = 0.4, size = 1.2, colour = "#1c4c78") +
+  labs(x = "|sex log2FC| on SD (unshrunk)", y = "|sex log2FC| on GFD (unshrunk)",
+       title = "Amplification") +
+  coord_equal() + theme_bw()
+
+p_male <- ggplot(dimorph, aes(abs(diet_F), abs(diet_M))) +
+  geom_abline(linetype = "dashed", colour = "grey40") +
+  geom_point(alpha = 0.4, size = 1.2, colour = "#7fb3d5") +
+  labs(x = "|diet log2FC| in females (unshrunk)", y = "|diet log2FC| in males (unshrunk)",
+       title = "Carried by males") +
+  coord_equal() + theme_bw()
+
+p_conc <- ggplot(cmp_sexGFD, aes(lfc_disc, lfc_val)) +
+  geom_hline(yintercept = 0, colour = "grey60") +
+  geom_vline(xintercept = 0, colour = "grey60") +
+  geom_abline(linetype = "dashed", colour = "grey40") +
+  geom_point(alpha = 0.4, size = 1.2, colour = "#e59866") +
+  labs(x = "sex log2FC on GFD, P76_3", y = "sex log2FC on GFD, P76_4",
+       title = "Agreement with P76_3") +
+  theme_bw()
+
+p_amp + p_male + p_conc
+```
+
+
+# H7 and H8: Liver-damage panels
+
+**H7 (exploratory).** Ductular (6) and cholestasis (8) panels: Diet×Sex interaction < 0, i.e. the diet effect on these scores is more negative in males than in females.
+
+**P76_3.** Interaction: ductular −0.659, cholestasis −0.132.
+
+**H8 (exploratory).** Fibrosis markers are lower in GFD males than in SD males.
+
+**P76_3.** GFD_M − SD_M = −0.757.
+
+The 7_inflammation panel is shown for context; it has no pre-specified test.
+
+```{r}
+h7 <- pc %>% 
+  dplyr::filter(panel %in% 
+                  c("5_fibrosis", "6_ductular", "7_inflammation", "8_cholestasis")) %>%
+  left_join(disc_ref, by = c("panel", "contrast"))
+
+ktab(h7, "H7/H8: liver-damage panel contrasts (P76_3 panel mapping)")
+
+for (pn in c("6_ductular", "8_cholestasis")) {
+  r <- get_c(pc, pn, "interaction")
+  log_result("H7", "exploratory", 
+             paste0(pn, ": Diet×Sex interaction"), 
+             "lm + emmeans, one-sided",
+             "dir", "<0", 
+             estimate = r$estimate, 
+             p = p_dir(r$t.ratio, r$df, -1),
+             disc = disc_ref$P76_3[disc_ref$panel == pn & disc_ref$contrast == "interaction"])
+}
+
+r <- get_c(pc, "5_fibrosis", "diet_in_M")
+
+log_result("H8", "exploratory", 
+           "5_fibrosis: GFD_M − SD_M", "lm + emmeans, one-sided",
+           "dir", "<0", 
+           estimate = r$estimate, 
+           p = p_dir(r$t.ratio, r$df, -1), 
+           disc =  disc_ref$P76_3[disc_ref$panel == "5_fibrosis" & disc_ref$contrast == "diet_in_M"])
+```
+
+## Results
+
+```{r}
+bind_rows(results_log) %>%
+  dplyr::filter(id == "H7") %>%
+  ktab("H7: Ductular (6) and cholestasis (8) panels: Diet×Sex interaction < 0.")
+```
+
+```{r}
+bind_rows(results_log) %>%
+  dplyr::filter(id == "H8") %>%
+  ktab("H8: Fibrosis markers are lower in GFD males than in SD males.")
+```
+
+```{r h8-plot, fig.width=6, fig.height=8}
+plot_panels(scores, c("5_fibrosis", "6_ductular", "7_inflammation", "8_cholestasis"),
+            "Liver-damage programs")
+```
+
+## Panel tests
+
+```{r}
+program_panels <- names(panels_sym)
+
+# score = mean z-score of gene panels for each samples
+scores <- sapply(program_panels, function(nm) {
+   colMeans(z[panels[[nm]], , drop = FALSE], na.rm = TRUE)
+})
+ 
+colnames(scores) <- program_panels
+
+# masculinization index: 
+# male-female program (1 axis, direct feminization test)
+scores <- cbind(scores,
+                masc_index = scores[, "1a_male_liver"] - scores[, "1b_female_liver"])
+
+test_program <- function(sc, name, cd) {
+  fit <- lm(sc ~ Diet * Sex + Date, data = cbind(cd, sc = sc))
+  emm <- emmeans(fit, ~ Diet * Sex)
+  # cell order in emm: SD_F, GFD_F, SD_M, GFD_M  (check with print(emm))
+
+  ctr <- list(
+    diet_in_F   = c(-1,  1,  0, 0),   # GFD_F - SD_F
+    diet_in_M   = c( 0,  0, -1, 1),   # GFD_M - SD_M
+    sex_in_SD   = c(-1,  0,  1, 0),   # SD_M  - SD_F
+    sex_in_GFD  = c( 0, -1,  0, 1),   # GFD_M - GFD_F
+    interaction = c( 1, -1, -1, 1)    # (GFD_M - SD_M) - (GFD_F - SD_F)
+  )
+
+  res <- summary(contrast(emm, method = ctr, adjust = "none"),
+                 infer = TRUE, level = 0.95)
+
+  data.frame(
+    Panel      = name,
+    Contrast   = res$contrast,
+    Estimate   = res$estimate,
+    SE         = res$SE,
+    df         = res$df,
+    t          = res$t.ratio,
+    p          = res$p.value,
+    CI_lower   = res$lower.CL,
+    CI_upper   = res$upper.CL
+  )
+}
+
+a4_tab <- do.call(rbind,
+                  lapply(colnames(scores),
+                         function(nm) test_program(scores[, nm], nm, cd)))
+
+a4_tab$p_BH <- ave(a4_tab$p, a4_tab$Contrast,
+                   FUN = function(p) p.adjust(p, method = "BH"))
+
+a4_tab %>%
+  kable(
+    caption = "Diet and sex effects on liver program scores. Linear model score ~ Diet × Sex + Date; estimates are differences in mean z-score (GFD − SD for diet, M − F for sex; interaction = diet effect in males − diet effect in females), with unadjusted two-sided p values and 95% confidence intervals.",
+    digits   = 3,
+    booktabs = TRUE,
+    align    = "llccccccc"
+  ) %>%
+  kable_styling(
+    latex_options     = c("hold_position"),
+    bootstrap_options = c("striped", "hover", "condensed")
+  )
+
+```
+
+The per-sample scores are saved to Excel.
+
+```{r}
+write.xlsx(a4_tab,
+           "../Results/panel_tests_P4.xlsx",
+           rownames=FALSE)
+```
+
+```{r}
+sc_long <- as.data.frame(scores) %>%
+  dplyr::mutate(Group = cd$Group, Diet = cd$Diet, Sex = cd$Sex) %>%
+  tidyr::pivot_longer(dplyr::all_of(colnames(scores)),
+                      names_to = "panel", values_to = "score") %>%
+  dplyr::mutate(panel = factor(panel, levels = colnames(scores)))
+```
+
+```{r}
+save(sc_long,file="../Results/figures/FS4_data_validation.RData")
+```
+
+# Summary
+
+```{r summary}
+summary_tab <- bind_rows(results_log)
+
+prim <- summary_tab$tier == "primary"
+sign_ok <- function(expected, est) {
+  dplyr::case_when(expected %in% c(">0") ~ est > 0,
+                   expected %in% c("<0") ~ est < 0,
+                   expected == ">0.5"    ~ est > 0.5,
+                   expected == "<1"      ~ est < 1,
+                   TRUE ~ NA)
+}
+
+summary_tab <- summary_tab %>%
+  dplyr::mutate(
+    p_decide = p,
+    ok_dir   = sign_ok(expected, P76_4),
+    verdict  = dplyr::case_when(
+      type == "dir"  & ok_dir & p_decide <  alpha ~ "replicated",
+      type == "dir"  & ok_dir & p_decide >= alpha ~ "same direction, n.s.",
+      type == "dir"  & !ok_dir                    ~ "opposite direction",
+      type == "tost" & p <  alpha                 ~ "equivalent",
+      type == "tost" & p >= alpha                 ~ "inconclusive",
+      type == "null" & p >= alpha                 ~ "holds",
+      type == "null" & p <  alpha                 ~ "violated",
+      TRUE ~ "NA")
+  ) %>%
+  dplyr::mutate(tier = factor(tier, levels = c("primary", "secondary", "exploratory"))) %>%
+  dplyr::arrange(id,tier) %>%
+  dplyr::select(id, tier, what, test, expected, P76_3, P76_4, p, verdict, note)
+
+kt <- summary_tab %>%
+  dplyr::mutate(across(c(P76_3, P76_4, p,), ~ signif(.x, 3))) %>%
+  kable(caption = "Validation of P76_3 hypotheses in P76_4", booktabs = TRUE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+good <- which(summary_tab$verdict %in% c("replicated", "equivalent", "holds"))
+bad  <- which(summary_tab$verdict %in% c("opposite direction", "violated"))
+
+if (length(good)) kt <- row_spec(kt, good, background = "#e8f3ea")
+if (length(bad))  kt <- row_spec(kt, bad,  background = "#f8e3e1")
+
+kt
+```
+
+```{r, eval=TRUE}
+write.xlsx(summary_tab,file.path(paths$out_dir, "hypothesis_validation_P76_4.xlsx"))
+```
+
+Notes on reading the table: p-values shown as 0 are below machine precision (< 2.2e-16). H1 has no automatic verdict; it is decided by the note column (Sex has the largest R²) together with p < α. One-sided p-values are not corrected across hypotheses; the GSEA p-values are BH-adjusted across the 9 target sets.
+
+::: {.callout-note title="Interpretation"}
+The central result of P76_3 replicates in the independent cohort: **the gluten-free diet changes the liver transcriptome mainly in males.** Every primary hypothesis replicates in the predicted direction with p < 0.05.
+
+- **Sex is the dominant axis (H1).** Sex explains 29% of the variance of the 2,000 most variable genes (P76_3: 31%); diet and the interaction each explain about 4%.
+- **The male diet signature replicates (H2).** 96% of the P76_3 male-diet genes change in the same direction in P76_4 males (Spearman rho = 0.78).
+- **Masculinization (H3).** GFD raises the masculinization index (interaction +0.36, P76_3 +0.40) and the male-liver panel (interaction +0.52, P76_3 +0.55) in males.
+- **Lipogenesis/cholesterol synthesis (H4).** The 3c panel falls in GFD males (interaction −1.00, P76_3 −1.06), and the cholesterol-homeostasis and both SREBP gene sets are negatively enriched in the male diet ranking.
+- **OXPHOS/translation and inflammation (H5).** In GFD males, OXPHOS, respiratory electron transport and ribosome sets are positively enriched, and TNFα/NF-κB, inflammatory response and IFN-γ sets negatively enriched, as in P76_3.
+- **Amplified sexual dimorphism (H6).** For P76_3 sex-DE genes, the sex difference is larger on GFD than on SD in 71% of genes, and the diet effect is larger in males than in females in 86%. The sign of the sex effect on GFD agrees with P76_3 for 93% of genes.
+- **Liver-damage panels (H7, H8, exploratory).** The ductular panel shows the expected negative interaction (−0.73, one-sided p = 0.047), and fibrosis markers are lower in GFD than in SD males (−1.10).
+
+**What did not replicate or remains open.**
+
+- The **cholestasis panel** shows no Diet×Sex interaction (−0.04, P76_3 −0.13).
+- The **global Diet×Sex PERMANOVA** term is not significant (R² = 0.039, p = 0.077; P76_3 R² = 0.055). The diet × sex effect is clear in targeted tests but small relative to the whole transcriptome.
+- **"Females are unaffected" is only partly supported.** No female diet effect is detectable (0 female diet DEGs; all female panel contrasts n.s.), but equivalence to 0 within ±0.3 is shown only for the masculinization index. For the male-liver (TOST p = 0.09) and lipogenesis (p = 0.25) panels, the data cannot exclude a small female effect.
+- The **inflammation panel** itself does not change in GFD males (−0.30, p = 0.26); the reduction of inflammatory programs rests on the GSEA sets.
+- The P76_3 observation of lower fibrosis scores in SD males than in SD females (−0.51) is not seen in P76_4 (+0.03); this was not a pre-specified test.
+
+**Effect sizes.** Panel-level effects are similar in size between cohorts, but far fewer genes reach genome-wide significance in P76_4 (male diet DEGs 213 vs 1286; Diet×Sex DEGs 1 vs 75), consistent with a smaller cohort (38 vs 44 animals) and somewhat weaker individual gene effects.
+:::
+
+```{r session}
+sessionInfo()
+```

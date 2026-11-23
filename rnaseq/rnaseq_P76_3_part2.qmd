@@ -1,0 +1,1602 @@
+---
+title: "PSC mice P76_3"
+subtitle: "Rnaseq dataset part2"
+format: 
+  html:  
+    embed-resources: true
+    keep-md: false
+    toc: true
+    toc-expand: 3
+    toc-depth: 6
+    toc-location: left
+    number-sections: true
+    number-depth: 6
+    code-fold: show
+    code-tools: true
+    code-summary: "Open code"
+    grid: 
+      body-width: 1000px
+      sidebar-width: 600px
+      margin-width: 100px
+execute: 
+  warning: true
+  print: true
+  echo: true
+editor: source
+project:
+  type: default
+  output-dir: output
+fontsize: 12 px
+---
+
+# Introduction
+
+This report presents a preliminary transcriptomic analysis of liver samples from a PSC mouse model (experiment P76_3), asking how diet and sex jointly shape hepatic gene expression. 
+
+RNA-seq data was processed using custom bioinformatic pipeline available at https://github.com/xpolak37/RNAseq_workflow. 
+
+Data from 44 animals (SD: 10F/11M; GFD: 11F/12M) were modeled in DESeq2 using the design Date + Diet + Sex + Diet:Sex, with SD and female as reference levels; the Diet×Sex interaction is the primary term of interest, since it tests whether diet acts differently in the two sexes rather than assuming a single "overall" diet effect. 
+
+After keeping genes detected (non-zero count) in at least 5 samples of at least one Diet × Sex group, 25981 genes were retained (section 3.1). 
+
+This part covers global structure (PCA, sample-distance heatmap, PERMANOVA), targeted differential expression and curated gene panels (masculinization, lipogenesis, liver-damage, bile-acid). Integration with serum bile-acid phenotypes and clinical parameters, and pathway enrichment (Hallmark, KEGG, Reactome), are in part 3. 
+
+One caveat runs through the whole analysis: the four groups were collected in blocks (SD_F first, GFD_M last; see A3), so collection order, which carries time-of-day and feeding-state information, is strongly confounded with group.
+
+```{r}
+source("custom_functions_rnaseq.R")
+```
+
+# Import
+
+Two inputs are loaded:
+
+- **Gene-level expression** (`tpm_data.tsv`): TPM values per gene and sample, produced by the RNA-seq pipeline.
+- **Sample metadata** (`metadata_P076v3.xlsx`): one row per animal with diet, sex, collection date/order and other annotations. Rows without an RNA-seq sample ID (`SampleIAB`) are dropped, a combined `Group` label (e.g. `GFD_M`) is created from Diet and Sex, and `SampleID` is set to the RNA-seq sample ID so that metadata rows can be matched to expression data.
+
+
+```{r}
+# load gene level data
+gene_df <- fread("../../Data/tpm_data.tsv") %>% as.data.frame()
+
+# load metadata
+sample_metadata <- read.xlsx("../../Data/metadata_P076v3.xlsx",detectDates = TRUE) %>%
+  dplyr::filter(!is.na(SampleIAB)) %>%
+  dplyr::mutate(Group=paste(Diet,Sex,sep = "_")) %>% 
+  dplyr::mutate(SampleID=SampleIAB)
+```
+
+
+```{r}
+# assign colors to groups
+cond_colours <- c("#e59866","#7fb3d5","#b03a2e","#1c4c78")[as.factor(sample_metadata$Group)]
+names(cond_colours) <- sample_metadata$Group
+
+group_colours <- c("GFD_F"="#e59866",
+                   "GFD_M"= "#7fb3d5",
+                   "SD_F"="#b03a2e",
+                  "SD_M"="#1c4c78")
+```
+
+
+# Analysis
+
+The chunk below builds the input for differential expression.
+
+- `tx2gene` is a transcript-to-gene lookup (`tx2gene.tsv`) built from the same Ensembl GRCm39 annotation that was used for the Salmon index, including gene symbols. Using the same release as the index ensures that every quantified transcript can be mapped to a gene.
+- `tximport()` reads the Salmon quantification of every sample and sums transcript-level estimates into gene-level estimated counts. It also keeps average transcript lengths, which DESeq2 later uses as a per-sample correction for differences in transcript usage. Transcript version suffixes (e.g. `.3`) are ignored so that IDs match the annotation.
+
+
+
+```{r,eval=FALSE}
+# transcript-to-gene table from the GRCm39 annotation used for the Salmon index
+tx2gene <- fread("../../Data/tx2gene.tsv")
+
+# Import Salmon quantifications
+files <- read.table("../../Data/samples.txt")$V2
+files <- paste0("../../", files)
+names(files) <- sample_metadata$SampleID
+
+# txi$counts is a gene x sample matrix of estimated counts.
+txi <- tximport(
+  files,
+  type = "salmon",
+  tx2gene = tx2gene[, c("tx_id", "gene_id")],
+  ignoreTxVersion = TRUE             # handles the ".3" version suffixes
+)
+
+```
+
+**Saving dataset**
+
+```{r,eval=FALSE}
+save(tx2gene,txi,file="../Results/transcript_import.RData")
+```
+
+**Load dataset**
+
+```{r}
+load("../Results/transcript_import.RData")
+
+# metadata to factors
+sample_metadata <- sample_metadata %>%
+  mutate(
+    Diet  = factor(Diet, levels = c("SD", "GFD")), 
+    Sex   = factor(Sex,  levels = c("F", "M")),        
+    Group = factor(paste(Diet, Sex, sep = "_")),
+    Date = factor(gsub("-","_",Date))
+  )
+
+# Build DESeq2 object (factorial design)
+dds <- DESeqDataSetFromTximport(
+  txi,
+  colData = sample_metadata,
+  design  = ~ Date + Diet * Sex            # = Diet + Sex + Diet:Sex
+)
+```
+
+## Filter
+
+Genes that are barely detected carry almost no information and only add to the multiple-testing burden. The filter below keeps a gene if it has a non-zero count in at least **5 samples** of at least one group (SD_F, SD_M, GFD_F or GFD_M). Requiring detection within a single group, rather than across all samples, keeps genes that are switched on in only one condition.
+
+```{r}
+# genes detected (count > 0) in >= 5 samples of at least one group
+min_count <- 5
+grp <- sample_metadata$Group
+keep <- sapply(levels(factor(grp)), function(g) {
+  rowSums(counts(dds)[, grp == g, drop = FALSE] > 0) >= min_count
+})
+keep <- rowSums(keep) >= 1   # passes in at least one group
+dds  <- dds[keep, ]
+
+cat(sum(keep), "genes kept after filtering\n")
+
+```
+
+## Run Deseq
+
+Design: Date + Diet + Sex + Diet:Sex. 
+
+Reference factors:
+Diet: SD
+Sex: F
+
+The full model is:
+
+**Date** - a covariate we're adjusting for (collection date)
+**Diet** - main effect of diet (Effect of diet on reference SEX=F)
+**Sex** - main effect of sex  (Effect of sex on reference Diet=SD)
+**Diet:Sex** - the interaction: whether diet's effect on expression differs between sexes (or equivalently, whether the sex difference depends on diet). This is usually the term we care about.
+
+```{r}
+dds <- DESeq(dds)
+resultsNames(dds)   # shows the coefficients 
+```
+
+::: {.callout-note title="Explanation"}
+
+**Intercept**: the model's baseline: the expected (log2) expression for a sample in every reference category at once — SD diet, female, date 26_11. Every other coefficient is a shift relative to this baseline. 
+
+**Date_27_11_vs_26_11**: the effect of processing date, 27_11 relative to 26_11. 
+
+**Diet_GFD_vs_SD**: the diet effect (GFD vs SD), in **females** only. Because Sex's reference is F, this coefficient is the GFD-vs-SD contrast evaluated at Sex = F. It is not "the diet effect overall." 
+
+**Sex_M_vs_F**: the sex effect (M vs F), in SD animals only. Symmetrically, Diet's reference is SD, so this is the M-vs-F contrast evaluated at Diet = SD. Not "sex effect overall".
+
+**DietGFD.SexM**: the interaction: how much the diet effect differs between the sexes (equivalently, how much the sex effect differs between diets — it's symmetric). Concretely, it's (diet effect in males) − (diet effect in females). Also, its (sex effect in GFD) − (sex effect in SD). If it's zero, diet acts the same in both sexes. If it's non-zero and significant, **diet's effect is sex-dependent**. It is the only coefficient that tests whether the sex difference changes with diet (Sex_M_vs_F tests the sex difference itself, but only within SD).
+:::
+
+## PCA
+
+Firstly, variance-stabilizing transformation (VST) is applied to our DESeq2 data. This is a preprocessing step used mainly for visualization and clustering, not for the differential-expression testing itself. 
+
+**Why?** Raw RNA-seq counts have a strong mean–variance dependence — highly expressed genes show much larger absolute variance than low-expressed ones. This "heteroskedasticity" means that if we feed raw or simply log-transformed counts into things like PCA or a sample-distance heatmap, the results get dominated by a handful of high-count genes, and the log of near-zero counts blows up the noise at the low end. 
+
+**What it does?** vst() transforms the counts so that variance becomes roughly constant across the range of mean expression, putting genes on a more comparable footing.
+
+
+```{r, fig.height=4,fig.width=5}
+# VST
+vsd <- vst(dds, blind = TRUE)
+
+# PCA coloured by Diet, shaped by Sex — tells us which factor dominates variance.
+pca_data <- plotPCA(vsd, intgroup = c("Diet", "Sex","Date"), returnData = TRUE)
+
+pv <- round(100 * attr(pca_data, "percentVar"))
+```
+
+**All in one**
+
+```{r}
+ggplot(pca_data, aes(PC1, PC2, colour = group)) +
+  geom_point(size = 4) +
+  labs(x = paste0("PC1: ", pv[1], "%"), y = paste0("PC2: ", pv[2], "%")) +
+  theme_bw() + 
+  scale_color_discrete(palette="Set3")
+```
+
+**Diet + Sex**
+
+Sex has the most visible effect (it separates the samples along PC1).
+
+```{r}
+pca_data2 <- plotPCA(vsd, intgroup = c("Diet", "Sex","Date"), 
+                     returnData = TRUE, pcsToUse = c(1,3))
+pv2 <- round(100 * attr(pca_data2, "percentVar"))   # % variance of PC1 and PC3
+
+pca_data <- pca_data %>% dplyr::mutate(Group=paste(Diet,Sex,sep = "_"))
+pca_data2 <- pca_data2 %>% dplyr::mutate(Group=paste(Diet,Sex,sep = "_"))
+
+p1 <- ggplot(pca_data, aes(PC1, PC2, colour = Group)) +
+  geom_point(size = 4) +
+  scale_color_manual(values=group_colours) + 
+  labs(x = paste0("PC1: ", pv[1], "%"), y = paste0("PC2: ", pv[2], "%")) +
+  theme_bw()
+
+p2 <- ggplot(pca_data2, aes(PC1, PC3, colour = Group)) +
+  geom_point(size = 4) +
+  scale_color_manual(values=group_colours) + 
+  labs(x = paste0("PC1: ", pv2[1], "%"), y = paste0("PC3: ", pv2[2], "%")) +
+  theme_bw()
+
+ggarrange(p1,p2,common.legend = TRUE)
+```
+
+```{r}
+# Adjust names to match your Group levels exactly
+pca_data$Group <- factor(
+  pca_data$Group,levels = c("SD_F", "GFD_F", "SD_M", "GFD_M"))
+
+group_colours <- c("SD_F" = "#E6B422", "GFD_F" = "#E07B28",
+                   "SD_M" = "#3A6EA5", "GFD_M" = "#3DA35D")
+group_shapes  <- c("SD_F" = 16, "GFD_F" = 16,
+                   "SD_M" = 17, "GFD_M" = 17)
+group_labels  <- c("SD_F" = "F SD", "GFD_F" = "F GFD",
+                   "SD_M" = "M SD", "GFD_M" = "M GFD")
+
+f_5a <- ggplot(pca_data, aes(PC1, PC2, colour = Group, shape = Group)) +
+  geom_point(size = 2.2) +
+  scale_colour_manual(values = group_colours) +
+  scale_shape_manual(values = group_shapes) +
+  labs(x = paste0("PC1: ", pv[1], " %"),
+       y = paste0("PC2: ", pv[2], " %"),
+       title = "PCA, exploratory cohort") +
+  guides(colour = guide_legend(ncol = 2), shape = guide_legend(ncol = 2)) +
+  theme_classic(base_size = 10) +
+  theme(
+    plot.title        = element_text(size = 10, face = "plain"),
+    plot.tag          = element_text(size = 14, face = "bold"),
+    axis.text         = element_text(colour = "black", size = 8),
+    axis.line         = element_line(linewidth = 0.4),
+    axis.ticks        = element_line(linewidth = 0.4),
+    legend.position   = c(0.02, 0.02),
+    legend.justification = c(0, 0),
+    legend.title      = element_blank(),
+    legend.text       = element_text(size = 7),
+    legend.key.size   = unit(0.35, "cm"),
+    legend.background = element_blank()
+  )
+
+f_5a
+  
+save(f_5a,file = "../Results/figures/F5A.RData")
+```
+
+## PCA + boxplots
+
+The PC1 and PC2 coordinates from the PCA above are compared between groups of samples. Each plot shows the distribution of sample scores on a component, and a Wilcoxon rank-sum test checks whether the groups differ on that component (stars: \* p < 0.05, \*\* p < 0.01, \*\*\* p < 0.001, ns = not significant). This shows which factor each component captures. These tests are exploratory: p-values are not corrected for the number of comparisons.
+
+**Sex**
+
+```{r,fig.height=3,fig.width=6}
+p1 <- ggplot(pca_data, aes(x=Sex, y=PC1)) +
+  geom_boxplot() + 
+  geom_jitter(width = 0.2,height = 0,aes(colour = Sex)) +
+  labs(y = paste0("PC1: ", pv[1], "%"), x = "Sex") +
+  theme_bw() + 
+  scale_color_manual(values=c("#ece134","#48a4e3")) + 
+  stat_compare_means(method = "wilcox.test",
+                   label = "p.signif",        # ***, **, *, ns
+                   label.x = 1.5)             # horizontal position
+
+p2 <- ggplot(pca_data, aes(x=Sex, y=PC2)) +
+  geom_boxplot() + 
+  geom_jitter(width = 0.2,height = 0,aes(colour = Sex)) +
+  labs(y = paste0("PC2: ", pv[2], "%"), x = "Sex") +
+  theme_bw() + 
+  scale_color_manual(values=c("#ece134","#48a4e3")) + 
+  stat_compare_means(method = "wilcox.test",
+                   label = "p.signif",        # ***, **, *, ns
+                   label.x = 1.5)             # horizontal position
+
+wrap_plots(p1,p2)
+```
+
+**Date**
+
+```{r,fig.height=3,fig.width=6}
+p1 <- ggplot(pca_data, aes(x=Date, y=PC1)) +
+  geom_boxplot() + 
+  geom_jitter(width = 0.2,height = 0,aes(colour = Date)) +
+  labs(y = paste0("PC1: ", pv[1], "%"), x = "Date") +
+  theme_bw() + 
+  scale_color_manual(values=c("black","darkgreen")) + 
+  stat_compare_means(method = "wilcox.test",
+                   label = "p.signif",        # ***, **, *, ns
+                   label.x = 1.5)             # horizontal position
+
+p2 <- ggplot(pca_data, aes(x=Date, y=PC2)) +
+  geom_boxplot() + 
+  geom_jitter(width = 0.2,height = 0,aes(colour = Date)) +
+  labs(y = paste0("PC2: ", pv[2], "%"), x = "Date") +
+  theme_bw() + 
+  scale_color_manual(values=c("black","darkgreen")) + 
+  stat_compare_means(method = "wilcox.test",
+                   label = "p.signif",        # ***, **, *, ns
+                   label.x = 1.5)             # horizontal position
+
+wrap_plots(p1,p2)
+```
+
+**Diet**
+
+```{r,fig.height=3,fig.width=6}
+p1 <- ggplot(pca_data, aes(x=Diet, y=PC1)) +
+  geom_boxplot() + 
+  geom_jitter(width = 0.2,height = 0,aes(colour = Diet)) +
+  labs(y = paste0("PC1: ", pv[1], "%"), x = "Diet") +
+  theme_bw() + 
+  scale_color_manual(values=c("lightgreen","orange")) + 
+  stat_compare_means(method = "wilcox.test",
+                   label = "p.signif",        # ***, **, *, ns
+                   label.x = 1.5)             # horizontal position
+
+p2 <- ggplot(pca_data, aes(x=Diet, y=PC2)) +
+  geom_boxplot() + 
+  geom_jitter(width = 0.2,height = 0,aes(colour = Diet)) +
+  labs(y = paste0("PC2: ", pv[2], "%"), x = "Diet") +
+  theme_bw() + 
+  scale_color_manual(values=c("lightgreen","orange")) + 
+  stat_compare_means(method = "wilcox.test",
+                   label = "p.signif",        # ***, **, *, ns
+                   label.x = 1.5)             # horizontal position
+
+wrap_plots(p1,p2)
+```
+
+**Diet_Sex**
+
+```{r,fig.height=3,fig.width=8}
+pca_data <- pca_data %>% dplyr::mutate(Group=paste(Diet,Sex,sep = "_"))
+
+grp <- unique(pca_data$Group)     
+my_comparisons <- combn(grp, 2, simplify = FALSE)
+
+p1 <- ggplot(pca_data, aes(x=Group, y=PC1)) +
+  geom_boxplot() + 
+  geom_jitter(width = 0.2,height = 0,aes(colour = Group)) +
+  labs(y = paste0("PC1: ", pv[1], "%"), x = "Group") +
+  theme_bw() + 
+  scale_color_manual(values=group_colours) +
+  stat_compare_means(comparisons = my_comparisons,
+                     method = "wilcox.test",
+                     label = "p.signif") 
+
+p2 <- ggplot(pca_data, aes(x=Group, y=PC2)) +
+  geom_boxplot() + 
+  geom_jitter(width = 0.2,height = 0,aes(colour = Group)) +
+  labs(y = paste0("PC2: ", pv[2], "%"), x = "Group") +
+  theme_bw() + 
+  scale_color_manual(values=group_colours) +
+  stat_compare_means(comparisons = my_comparisons,
+                     method = "wilcox.test",
+                     label = "p.signif") 
+wrap_plots(p1,p2)
+```
+
+## PERMANOVA
+
+PERMANOVA tests whether groups of samples differ in their overall expression profile, using distances between samples rather than individual genes. The chunk below:
+
+1. Takes the 2,000 most variable genes on the VST scale and computes Euclidean distances between all pairs of samples.
+
+2. Checks **dispersion homogeneity** with `betadisper()`. PERMANOVA assumes groups have a similar spread; if they differ strongly in spread, a significant PERMANOVA result could reflect differences in variability rather than a shift in the average profile.
+
+3. Runs **PERMANOVA** (`adonis2`) with the same design as DESeq2 (Date + Diet × Sex). Terms are tested sequentially in the order written, so Date is accounted for first. R² is the fraction of total variance attributed to each term, and p-values come from 9,999 random permutations of the sample labels.
+
+4. Runs a second, **date-stratified** PERMANOVA (Diet × Sex, with permutations restricted to within each collection date). This is an alternative way to protect against date effects: samples are only shuffled among animals collected on the same day.
+
+```{r}
+# Build distance matrix from VST (top-variance genes)
+# use top-variance genes 
+m = assay(vsd)
+rv    <- matrixStats::rowVars(m)                     
+top   <- order(rv, decreasing = TRUE)[seq_len(min(2000, length(rv)))]
+mat   <- t(m[top, ])                                   # samples × genes
+cd <- as.data.frame(colData(dds))
+
+# align metadata to the expression matrix
+meta  <- cd[match(rownames(mat), cd$SampleIAB), ]      
+nrow(meta) == nrow(mat)
+
+d <- dist(mat)# Euclidean on VST
+
+# Dispersion homogeneity 
+bd <- betadisper(d, meta$Group)
+
+# if significant -> groups differ in SPREAD, PERMANOVA may be  invalid
+anova(bd) %>% kable(
+    caption = "Results for test of dispersion homogeneity",
+    digits  = 8,
+    booktabs = TRUE,
+    align = "llcccccc"
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position"),               
+    bootstrap_options = c("striped", "hover", "condensed")  
+  )    
+
+boxplot(bd)             # visualize per-group spread
+
+# PERMANOVA — the location test
+# Match DESeq2 design: Date + Diet * Sex
+set.seed(123)
+pmv <- adonis2(d ~ Date + Diet * Sex,
+               data = meta,
+               by = "terms", # sequential; tests each term in order
+               permutations = 9999)
+pmv %>%    kable(
+    caption = "PERMANOVA 1 result",
+    digits  = 8,
+    booktabs = TRUE,
+    align = "llcccccc"
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position"),               
+    bootstrap_options = c("striped", "hover", "condensed")  
+  )    
+
+# Confound aware 
+set.seed(123)
+pmv2 <- adonis2(d ~ Diet * Sex,
+               data = meta,
+               strata = meta$Date,
+               by = "terms", # sequential; tests each term in order
+               permutations = 9999)
+pmv2 %>%    kable(
+    caption = "PERMANOVA 2 result",
+    digits  = 8,
+    booktabs = TRUE,
+    align = "llcccccc"
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position"),               
+    bootstrap_options = c("striped", "hover", "condensed")  
+  )    
+```
+
+
+## Clustering
+
+Euclidean distances between all samples are computed on the full VST matrix and shown as a heatmap, with samples hierarchically clustered so that similar samples sit next to each other. The annotation bars show Diet, Sex and Date for each sample, which makes it easy to see which factor the clustering follows. Darker blue means more similar samples.
+
+```{r, fig.height=8,fig.width=6}
+# Sample-to-sample distance heatmap.
+sampleDists <- dist(t(assay(vsd)))
+p <- pheatmap(as.matrix(sampleDists),
+         clustering_distance_rows = sampleDists,
+         clustering_distance_cols = sampleDists,
+         col = colorRampPalette(rev(brewer.pal(9, "Blues")))(255),
+         annotation_col = as.data.frame(colData(dds)[, c("Diet", "Sex", "Date")]))
+
+p
+```
+
+## A1: dataset control
+
+Number of animals in each Diet × Sex combination.
+
+```{r}
+table(sample_metadata$Diet,sample_metadata$Sex)
+```
+
+## A2: Date + Diet * Sex
+
+**GFD vs SD (diet effect)**
+
+- **IN FEMALES** - the diet effect in females is captured entirely by the main-effect coefficient, because females are the reference (single coef is enough)
+
+- **IN MALES**- there's no single coefficient for "diet effect in males." We have to build it by adding the female diet effect plus the male-specific adjustment: 
+
+DietGFD.SexM = (DIET_MALES) - (DIET_FEMALES), so then: 
+
+DIET_MALES = DIET_FEMALES + DietGFD.SexM 
+
+**M vs F (Sex effect)**
+
+- **IN SD** - we have it already in the model: Sex_M_vs_F is effect of sex in reference diet (SD)
+
+- **IN GFD**- SEX_GFD = SEX_SD + DietGFD.SexM 
+
+```{r}
+alpha <- 0.05
+lfc   <- 1          
+
+# ashr: it shrinks single coefficients AND summed contrasts
+
+# GFD vs SD (diet effect)
+## in females
+res_diet_in_F  <- lfcShrink(dds, coef = "Diet_GFD_vs_SD", type = "ashr") 
+
+## in males
+res_diet_in_M  <- lfcShrink(
+  dds, contrast = list(c("Diet_GFD_vs_SD","DietGFD.SexM")),
+  type = "ashr")              
+
+# M vs F (sex effect)
+
+## IN SD
+res_sex_in_SD  <- lfcShrink(dds, coef = "Sex_M_vs_F", type = "ashr")          
+
+## IN GFD
+res_sex_in_GFD <- lfcShrink(
+  dds, contrast = list(c("Sex_M_vs_F","DietGFD.SexM")),
+  type = "ashr")                                         
+
+# Interaction: does the diet effect depend on sex?
+res_int <- lfcShrink(dds, coef = "DietGFD.SexM", type = "ashr")
+
+# Summarise significant-gene counts
+summarise_res <- function(res, sym,name) {
+  sig <- subset(as.data.frame(res),
+                !is.na(padj) & padj < alpha & abs(log2FoldChange) >= lfc)
+  message(sprintf("%-24s : %d significant genes", name, nrow(sig)))
+  sig <- sig %>%
+  rownames_to_column("gene_id") %>%     # name the key column correctly
+  left_join(sym, by = "gene_id") 
+ 
+  write.xlsx(sig,paste0("../Results/",name,".xlsx"),rownames=FALSE)
+  return(sig)
+}
+
+# keeps only the columns we pick and collapses the result to unique combinations, throwing away the transcript-level duplication.
+sym <- distinct(tx2gene, gene_id, gene_name)   # lookup 
+
+# summary
+sig_diet_F  <- summarise_res(res_diet_in_F,sym,  "Diet effect in females")
+sig_diet_M  <- summarise_res(res_diet_in_M,sym,  "Diet effect in males")
+sig_sex_SD  <- summarise_res(res_sex_in_SD,sym,  "Sex effect in SD")
+sig_sex_GFD <- summarise_res(res_sex_in_GFD,sym, "Sex effect in GFD")
+sig_int     <- summarise_res(res_int,sym,        "Diet x Sex interaction")
+```
+
+**Comprehensive summary**
+
+Now, we want also mean normalized counts, TPM in both groups for all genes
+
+`summarise_all_res()` (from the helper functions) builds a complete table for **all** genes, not only the significant ones: shrunk log2 fold change, p-values, and the mean normalized counts and mean TPM in each of the two compared groups. Having group means next to fold changes makes it easy to judge whether a change is biologically meaningful (e.g. a large fold change from almost zero expression).
+
+```{r}
+# summary
+diet_in_F <- summarise_all_res(res_diet_in_F, sym, "diet_in_F",
+                           txi, dds, sample_metadata,
+                           groups = c("SD_F", "GFD_F"))
+
+diet_in_M <- summarise_all_res(res_diet_in_M, sym, "diet_in_M",
+                           txi, dds, sample_metadata,
+                           groups = c("SD_M", "GFD_M"))
+
+
+sex_in_SD <- summarise_all_res(res_sex_in_SD, sym, "sex_in_SD",
+                           txi, dds, sample_metadata,
+                           groups = c("SD_F", "SD_M"))
+
+sex_in_GFD <- summarise_all_res(res_sex_in_GFD, sym, "sex_in_GFD",
+                           txi, dds, sample_metadata,
+                           groups = c("GFD_F", "GFD_M"))
+
+sex_diet_int <- summarise_all_res(res_int, sym, "sex_diet_int",
+                           txi, dds, sample_metadata,
+                           groups = c("GFD_F", "GFD_M","SD_F", "SD_M"))
+```
+
+### Visualization
+
+Volcano plots of the diet effect in females and in males. Each point is a gene: the x-axis is the shrunk log2 fold change (GFD vs SD) and the y-axis is −log10(padj), so genes higher up are more significant. Fold changes beyond ±10 are clipped to the plot edge, and both panels share the same x- and y-axis ranges so that the two sexes can be compared directly.
+
+```{r,fig.height=3,fig.width=8}
+# shared clip so both panels use the SAME x-axis
+shared_clip <- 10   # anything beyond is low-count noise
+
+p_diet_F <- make_volcano(
+  res_diet_in_F, 
+  "Diet effect in females", 
+  clip = shared_clip)
+
+p_diet_M <- make_volcano(
+  res_diet_in_M, 
+  "Diet effect in males",   
+  clip = shared_clip)
+
+# matched y-axis too, so panels are truly comparable
+ymax <- max(-log10(na.omit(c(res_diet_in_F$padj, res_diet_in_M$padj))))
+p_diet_F <- p_diet_F + ylim(0, ymax)
+p_diet_M <- p_diet_M + ylim(0, ymax)
+
+(p_diet_F | p_diet_M) + plot_layout(guides = "collect")
+```
+
+```{r}
+p_int <- make_volcano(
+  res_int, "Diet × Sex interaction",
+  xlab = expression(Delta~log[2]~"(diet effect: M − F)"),
+  clip = shared_clip
+)
+p_int
+```
+
+```{r}
+f_5b <- make_volcano_publication(
+  res_diet_in_M,
+  title = "Diet effect in males, exploratory cohort",
+  xlab=expression(log[2]~FC~"GFD vs SD (males)"),
+  clip = 4
+)
+f_5b
+
+save(f_5b,file = "../Results/figures/F5B.RData")
+
+```
+
+::: {.callout-note title="Interpretation"}
+
+Splitting the diet effect by sex reveals a striking asymmetry (padj < `r alpha`, |log2FC| ≥ `r lfc`): 
+
+- `r nrow(sig_diet_F)` genes respond to diet in females
+
+- `r nrow(sig_diet_M)` genes respond to diet in males 
+
+The sex difference is itself diet-dependent: `r nrow(sig_sex_SD)` genes differ by sex under SD, but `r nrow(sig_sex_GFD)` differ by sex under GFD (about `r round(nrow(sig_sex_GFD)/nrow(sig_sex_SD))`×), i.e. diet strongly amplifies sexual dimorphism. 
+
+The formal interaction term flags `r nrow(sig_int)` genes as significantly sex-dependent in their diet response. The consistent message is that essentially all of the diet response lives on the male side, which makes males the informative group for the panel and pathway analyses that follow.
+
+**Caveat:** GFD males were collected last (see A3), and the male diet genes drift with collection order more than background genes do. Part of the male-specific response may therefore reflect time of collection rather than diet.
+
+:::
+
+## Gene panel
+
+Several analyses below use curated gene panels: small sets of marker genes that represent a biological program. The table lists the genes and their roles for panels 3a–4 (glucocorticoid targets, fasting, lipogenesis, circadian clock); the full list of panels, including the sex-specific liver programs (1a–1c), immediate-early/stress genes (2) and liver-damage panels (5–8), is defined in the code below.
+
+| Panel | Gene | Role |
+|-------|------|------|
+| **3a — GC targets** | Tsc22d3 (GILZ) | Canonical glucocorticoid-induced anti-inflammatory gene |
+| | Fkbp5 | Co-chaperone; one of the most reliable GC-response markers |
+| | Klf15 | GC-induced TF linking steroids to amino-acid/lipid metabolism |
+| | Sds | GC-inducible amino-acid catabolism enzyme |
+| | Zbtb16 (PLZF) | GC-responsive TF tied to metabolism and immunity |
+| | Per1 | Clock gene that is also directly GC-inducible |
+| **3b — Fasting** | Fgf21 | Fasting-induced hepatokine driving the starvation response |
+| | Hmgcs2 | Rate-limiting enzyme of ketone-body production |
+| | Cpt1a | Controls mitochondrial fatty-acid import for β-oxidation |
+| | Ppargc1a (PGC-1α) | Master coactivator of fasting/oxidative metabolism |
+| | Pck1 (PEPCK) | Rate-limiting gluconeogenesis enzyme |
+| | G6pc1 | Final step of hepatic glucose output |
+| | Angptl4 | Fasting-induced regulator of lipoprotein lipase |
+| | Slc25a20 | Carnitine/acylcarnitine carrier feeding β-oxidation |
+| **3c — Lipogenesis** | Fasn | Fatty-acid synthase, core de novo lipogenesis enzyme |
+| | Scd1 | Desaturates saturated → monounsaturated fatty acids |
+| | Elovl6 | Elongates fatty-acid chains during synthesis |
+| | Acaca (ACC1) | Committed, rate-limiting step of fatty-acid synthesis |
+| | Srebf1 (SREBP-1c) | Master TF driving lipogenic genes |
+| | Mlxipl (ChREBP) | Glucose-sensing TF for lipogenesis |
+| | Hmgcs1 | Cytosolic HMG-CoA synthase (mevalonate pathway) |
+| | Hmgcr | Rate-limiting cholesterol synthesis enzyme (statin target) |
+| | Sqle | Key regulatory step in cholesterol biosynthesis |
+| | Ldlr | LDL receptor; SREBP-controlled cholesterol uptake |
+| | Insig1 | Feedback regulator restraining SREBP activation |
+| **4 — Circadian** | Bmal1 (Arntl) | Central positive-limb clock TF |
+| | Npas2 | CLOCK paralog partnering BMAL1 |
+| | Nr1d1 / Nr1d2 (REV-ERBα/β) | Nuclear receptors of the repressive stabilizing loop |
+| | Per1 / Per2 / Per3 | Period genes of the negative-feedback repressor limb |
+| | Cry1 / Cry2 | Cryptochrome repressors that partner with PER |
+| | Dbp / Tef / Hlf | PAR-bZIP clock-output transcription factors |
+| | Nfil3 (E4BP4) | Repressor opposing the PAR-bZIP factors |
+| | Ciart (CHRONO) | Additional BMAL1 repressor fine-tuning the clock |
+
+**Building panels**
+
+For the panel analyses, the VST is recomputed with `blind = FALSE`. Here the design is used when estimating how variance depends on expression level. This is recommended when the transformed values are used for downstream quantitative comparisons between groups, since large group differences would otherwise inflate the variance estimates. `m` is the resulting gene × sample expression matrix.
+
+```{r}
+vsd <- vst(dds, blind = FALSE)
+m  <- assay(vsd)  # genes x samples
+```
+
+```{r}
+panels_sym <- list(
+  `1a_male_liver`   = c("Hsd3b5","Cyp4a12a","Cyp4a12b","Cyp2d9","Cyp7b1","Slco1a1",
+                        "Elovl3","Nudt7","Ugt2b1","Bcl6"),          
+  `1b_female_liver` = c("Cyp2b9","Cyp3a41a","Cyp3a44","Cyp2a4","Sult3a1","Sult2a1",
+                        "Fmo3","A1bg","Nnmt","Cux2"),
+  `1c_GH_STAT5`     = c("Ghr","Stat5b","Socs2","Cish","Igf1","Igfals","Socs3"),
+  `2_IEG_stress`    = c("Fos","Fosb","Jun","Junb","Jund","Egr1","Atf3","Dusp1",
+                        "Nr4a1","Hspa1a","Hspa1b"),
+  `3a_GC_targets`   = c("Tsc22d3","Fkbp5","Klf15","Sds","Zbtb16","Per1"),
+  `3b_fasting`      = c("Fgf21","Hmgcs2","Cpt1a","Ppargc1a","Pck1","G6pc1",
+                        "Angptl4","Slc25a20"),
+  `3c_lipogenesis`  = c("Fasn","Scd1","Elovl6","Acaca","Srebf1","Mlxipl","Hmgcs1",
+                        "Hmgcr","Sqle","Ldlr","Insig1"),
+  `4_circadian`     = c("Bmal1","Npas2","Nr1d1","Nr1d2","Per1","Per2","Per3","Cry1",
+                        "Cry2","Dbp","Tef","Hlf","Nfil3","Ciart"),
+  `5_fibrosis`      = c("Col1a1","Col1a2","Col3a1","Acta2","Timp1","Timp2","Lox",
+                        "Pdgfrb","Tgfb1","Sparc"),
+  `6_ductular`      = c("Krt19","Krt7","Epcam","Sox9","Spp1","Cldn7","Hnf1b"),
+  `7_inflammation`  = c("Ccl2","Ccl5","Cxcl1","Cxcl9","Tnf","Il1b","Il6","Lcn2",
+                        "Saa1","Saa2","Adgre1","Itgam","Mmp12"),
+  `8_cholestasis`   = c("Cyp7a1","Cyp8b1","Cyp27a1","Cyp2c70","Cyp2a12","Nr0b2",
+                        "Nr1h4","Slc10a1","Abcb11","Abcc3","Abcc4","Slc51a","Slc51b",
+                        "Baat","Abcb4")
+)
+
+# "Mup family "
+mup_syms <- grep("^Mup[0-9]", sym$gene_name, value = TRUE) %>% unique()
+panels_sym[["1a_male_liver"]] <- c(panels_sym[["1a_male_liver"]], mup_syms)
+cat("Mup family notation found in :", length(mup_syms), "genes\n")
+
+# map with gene id and gene name
+sym2id <- function(s) sym$gene_id[match(s, sym$gene_name)]
+
+# QC / coverage-check step: for each gene panel
+# it counts how many of requested genes actually made it into expression data,
+# and reports which genes dropped out and why.
+coverage <- lapply(names(panels_sym), function(nm) {
+  s  <- panels_sym[[nm]]
+  id <- sym2id(s)
+  in_annot <- !is.na(id)
+  in_data  <- in_annot & id %in% rownames(m)
+  data.frame(
+    panel             = nm,
+    requested         = length(s),
+    in_data           = sum(in_data),
+    not_in_annotation = paste(s[!in_annot],            collapse = ", "),
+    filtered_lowcount = paste(s[in_annot & !in_data],  collapse = ", ")
+  )
+}) %>% dplyr::bind_rows()
+
+coverage %>%
+  kable(
+    caption = "Genes detected in our RNAseq dataset",
+    digits  = 8,
+    booktabs = TRUE,
+    align = "llcccccc"
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position"),               
+    bootstrap_options = c("striped", "hover", "condensed")  
+  ) 
+
+# case-insensitive
+missing_all <- unique(unlist(lapply(panels_sym, function(s) s[is.na(sym2id(s))])))
+if (length(missing_all)) {
+  cat("\ncase-insensitive:\n")
+  for (g in missing_all) {
+    hit <- grep(paste0("^", g, "$"), sym$gene_name, ignore.case = TRUE, value = TRUE)
+    if (length(hit)) cat(sprintf("  %-12s -> %s\n", g, paste(hit, collapse = ", ")))
+  }
+}
+
+# final panels
+panels <- lapply(panels_sym, function(s) {
+  id <- sym2id(s); unique(id[!is.na(id) & id %in% rownames(m)])
+})
+```
+
+## A3: Time gradient within groups 
+
+Checks whether collection order is balanced across the four groups. The boxplot shows the order positions of each group and the Kruskal–Wallis test asks whether they differ. If one group had been collected systematically earlier or later, time-of-day effects would be confounded with that group.
+
+```{r}
+# prepare sample metadata
+cd <- as.data.frame(colData(dds))
+cd$Order <- as.numeric(cd$Order)
+
+# Are Diet/Sex/Group distributed evenly across Order?
+boxplot(Order ~ Group, data = cd)
+kruskal.test(Order ~ Group, data = cd)
+```
+
+::: {.callout-warning title="Interpretation"}
+
+Collection order is **not** balanced: the groups were collected in blocks, SD_F first, then GFD_F, SD_M and GFD_M last. Group is therefore strongly confounded with time of collection (time of day and time since the last meal). The within-group drift tests below can only detect trends *inside* a group; they cannot separate a between-group difference from a time-of-collection difference.
+
+One point in favour of a real diet effect: the order gap between SD and GFD is similar in females and in males, yet only males respond to diet. This argues against a simple linear time effect, but it cannot exclude a non-linear one (e.g. fasting effects that appear only late in the session).
+
+:::
+
+### All genes
+
+Samples were collected in a sequence (`Order`), and time of collection can affect liver expression, both through the circadian clock and through handling. This section checks whether expression drifts with collection order **within** groups, i.e. beyond what Diet and Sex explain.
+
+For every gene, `order_drift()` (helper function) fits expression ~ Group + Order on the VST scale and reports the Order slope, its t-statistic and a BH-adjusted p-value. A significant slope means the gene changes steadily with collection order among animals of the same group. The chunk prints the number of such genes and the top hits.
+
+```{r}
+vsd_a3 <- vst(dds, blind = FALSE)
+m      <- assay(vsd_a3)  # genes x samples
+
+# calculate order drift
+# ~ Group + Order
+drift <- order_drift(m, cd)
+
+# significance
+sig_order <- subset(drift, padj < 0.05)
+
+# show results
+cat(nrow(sig_order), "of", nrow(drift),
+    "genes have within-group order drift (padj<0.05)\n")
+
+# genes with drift
+head(sig_order[order(sig_order$padj), c("gene_name","slope","t","padj")]) %>% 
+  kable(
+    caption = "Genes with significant drift within-groups",
+    booktabs = TRUE,
+    align = "llcccccc"
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position"),               
+    bootstrap_options = c("striped", "hover", "condensed")  
+  )
+```
+
+**Visualization**
+
+```{r,fig.height=4,fig.width=8}
+plot_df <- drift %>% 
+  dplyr::mutate(diet_M = gene_id %in% sig_diet_M$gene_id)
+
+# the distribution of order-drift slopes across all genes
+# a symmetric bump centered on zero means most genes have 
+# no systematic order trend
+p1 <- ggplot(drift, aes(slope)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_histogram(bins = 80, fill = "#48a4e3") +
+  coord_cartesian(xlim = quantile(drift$slope, c(.005, .995), na.rm = TRUE)) +
+  labs(x = "within-group Order slope", y = "Gene count")
+
+# Do male-specific diet genes stronger order drift than background? 
+# the grey curve is all the background genes, the red curve is just the male-diet genes
+# We are looking for whether the red curve sits to the right of the grey curve.
+# Red overlapping / left of grey → the male-diet genes drift with order no more than typical genes.
+# Red to the right of grey → the male-diet genes drift with order more than typical genes (possible order artifact).
+p2 <- ggplot(plot_df, aes(abs(t), colour = diet_M)) +
+  geom_density(linewidth = 0.9) +
+  scale_colour_manual(values = c("grey60", "#B33B3B"),
+                      labels = c("background", "M-diet effect"), name = NULL) +
+  labs(x = "|t| (Order term)", y = "density")
+
+(ggtheme(p1) | ggtheme(p2)) + patchwork::plot_layout(guides = "collect")
+```
+
+
+**Left panel (p1)**
+Looks healthy. The slope distribution is a clean, roughly symmetric bump centered on zero. Most genes show little to no systematic trend with Order, and there's no global shift off zero. So there isn't a coherent, genome-wide directional drift - the technical gradient isn't dominating everything. 
+
+**Right panel (p2)** 
+The red curve (M-diet genes) is clearly shifted to the right of the grey (background). Background |t| peaks around 0.5–1.5 with most mass below 2, while the M-diet curve peaks sharply around 2 and has substantially more mass in the 2–3 range. In plain terms: our significant male-diet genes have systematically stronger order-drift than typical genes. 
+Two formal tests of the visual impression in the right panel: the Kolmogorov–Smirnov test asks whether the two |t| distributions differ in shape or location, and the Wilcoxon test asks whether their medians differ.
+
+```{r}
+ks.test(abs(plot_df$t[plot_df$diet_M]),
+        abs(plot_df$t[!plot_df$diet_M]))          # distribution shift
+wilcox.test(abs(t) ~ diet_M, data = plot_df)      # median shift
+```
+
+Both tests confirm that the male-diet genes have stronger within-group order drift than background genes. No single gene reaches significance for drift, so this is a population-level signal, but together with the unbalanced collection order it means the male diet response should be interpreted with the time-of-collection caveat in mind.
+
+### Panel score
+
+The drift test is repeated at the panel level. Each gene is first z-scored across samples (centered to mean 0 and scaled to standard deviation 1), so that genes with different expression levels contribute equally. A panel score is then the mean z-score of the panel's genes in each sample: one number per sample that summarizes how active the program is. Each panel score is tested against Order, again within groups (score ~ Group + Order), with BH correction across panels.
+
+```{r}
+# z-score each gene across samples
+z <- t(scale(t(m)))
+
+# loop over panels and build a panel score
+# For each panel, it grabs that panel's genes and computes sc 
+# sc = the mean z-score across the panel's genes, for each sample. 
+# So sc is one number per sample — a summary "how active is this panel in this sample."
+
+score_tab <- lapply(names(panels), function(nm) {
+  ids <- panels[[nm]]; if (length(ids) < 2) return(NULL)
+  
+  # the mean z-score across the panel's genes
+  sc <- colMeans(z[ids, , drop = FALSE], na.rm = TRUE) # panel score per sample
+  
+  # test the panel score against Order
+  co <- summary(lm(sc ~ Group + Order, 
+                   data = cbind(cd, sc = sc)))$coefficients["Order", ]
+  data.frame(panel = nm, n = length(ids),
+             slope = co[1], se = co[2], t = co[3], p = co[4])
+}) %>%  dplyr::bind_rows()
+
+
+score_tab$padj <- p.adjust(score_tab$p, "BH")
+score_tab %>% 
+  kable(
+    caption = "Gene panels' drift within-groups",
+    booktabs = TRUE,
+    align = "llcccccc"
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position"),               
+    bootstrap_options = c("striped", "hover", "condensed")  
+  )
+```
+
+### Circadian genes
+
+The circadian panel is examined gene by gene. The plot shows each clock gene's expression against collection order, with a separate trend line for each group and point shape showing the collection date. If collection spanned different times of day, clock genes would be expected to change steadily with Order.
+
+```{r}
+clock_ids <- panels[["4_circadian"]]
+
+# vst expression for each panel gene for each sample
+clock_long <- as.data.frame(t(m[clock_ids, , drop = FALSE])) %>%
+  rownames_to_column("SampleID") %>%
+  dplyr::mutate(Order = cd$Order, 
+                Group = cd$Group,
+                Date = cd$Date) %>%
+  tidyr::pivot_longer(
+    dplyr::all_of(clock_ids), 
+    names_to = "gene_id", values_to = "expr") %>% 
+  dplyr::left_join(sym, by = "gene_id")
+
+# plot
+p_clock <- ggplot(clock_long, aes(Order, expr, colour = Group, shape=Date)) +
+  geom_point(size = 1.4, alpha = 0.75) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 0.6) +  
+  facet_wrap(~ gene_name, scales = "free_y") + # for each gene
+  scale_colour_manual(values = group_colours) +
+  labs(x = "Order", y = "vst expression",
+       title = "Circadian genes vs. order (slope within group)")
+
+```
+
+```{r,fig.height=7,fig.width=10}
+ggtheme(p_clock)
+```
+
+Order-drift statistics (from `order_drift()` above) for the clock genes.
+
+```{r}
+drift %>% dplyr::filter(gene_id %in% clock_ids) %>%
+  dplyr::left_join(sym, by = "gene_id") %>%
+  dplyr::select(gene_name.x, slope, t, p, padj) %>% 
+  kable(
+    caption = "Circadian gene's drift",
+    booktabs = TRUE,
+    align = "llcccccc"
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position"),               
+    bootstrap_options = c("striped", "hover", "condensed")  
+  )
+```
+
+### Panels 3-4
+
+Order-drift results for individual genes of the panels most likely to respond to time of collection and feeding state (glucocorticoid targets, fasting, lipogenesis), sorted by adjusted p-value.
+
+```{r}
+panel_ids <- unlist(panels[c("3a_GC_targets","3b_fasting",
+                             "3c_lipogenesis")])
+
+panel_drift <- drift %>%
+  dplyr::filter(gene_id %in% panel_ids) %>%
+  dplyr::left_join(
+    tibble::enframe(rep(names(panels), lengths(panels)),
+                    name = NULL, value = "panel") %>%
+      dplyr::mutate(gene_id = unlist(panels)),
+    by = "gene_id"
+  ) %>%
+  dplyr::select(panel, gene_name, slope, t, p, padj) %>%
+  dplyr::arrange(padj)
+
+panel_drift %>% 
+  kable(
+    caption = "Drifts for selected panels",
+    booktabs = TRUE,
+    align = "llcccccc"
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position"),               
+    bootstrap_options = c("striped", "hover", "condensed")  
+  )
+```
+
+## Panel tests
+
+```{r}
+program_panels <- names(panels_sym)
+
+# score = mean z-score of gene panels for each samples
+scores <- sapply(program_panels, function(nm) {
+   colMeans(z[panels[[nm]], , drop = FALSE], na.rm = TRUE)
+})
+ 
+colnames(scores) <- program_panels
+
+# masculinization index: 
+# male-female program (1 axis, direct feminization test)
+scores <- cbind(scores,
+                masc_index = scores[, "1a_male_liver"] - scores[, "1b_female_liver"])
+
+test_program <- function(sc, name, cd) {
+  fit <- lm(sc ~ Diet * Sex + Date, data = cbind(cd, sc = sc))
+  emm <- emmeans(fit, ~ Diet * Sex)
+  # cell order in emm: SD_F, GFD_F, SD_M, GFD_M  (check with print(emm))
+
+  ctr <- list(
+    diet_in_F   = c(-1,  1,  0, 0),   # GFD_F - SD_F
+    diet_in_M   = c( 0,  0, -1, 1),   # GFD_M - SD_M
+    sex_in_SD   = c(-1,  0,  1, 0),   # SD_M  - SD_F
+    sex_in_GFD  = c( 0, -1,  0, 1),   # GFD_M - GFD_F
+    interaction = c( 1, -1, -1, 1)    # (GFD_M - SD_M) - (GFD_F - SD_F)
+  )
+
+  res <- summary(contrast(emm, method = ctr, adjust = "none"),
+                 infer = TRUE, level = 0.95)
+
+  data.frame(
+    Panel      = name,
+    Contrast   = res$contrast,
+    Estimate   = res$estimate,
+    SE         = res$SE,
+    df         = res$df,
+    t          = res$t.ratio,
+    p          = res$p.value,
+    CI_lower   = res$lower.CL,
+    CI_upper   = res$upper.CL
+  )
+}
+
+a4_tab <- do.call(rbind,
+                  lapply(colnames(scores),
+                         function(nm) test_program(scores[, nm], nm, cd)))
+
+a4_tab$p_BH <- ave(a4_tab$p, a4_tab$Contrast,
+                   FUN = function(p) p.adjust(p, method = "BH"))
+
+a4_tab %>%
+  kable(
+    caption = "Diet and sex effects on liver program scores. Linear model score ~ Diet × Sex + Date; estimates are differences in mean z-score (GFD − SD for diet, M − F for sex; interaction = diet effect in males − diet effect in females), with unadjusted two-sided p values and 95% confidence intervals.",
+    digits   = 3,
+    booktabs = TRUE,
+    align    = "llccccccc"
+  ) %>%
+  kable_styling(
+    latex_options     = c("hold_position"),
+    bootstrap_options = c("striped", "hover", "condensed")
+  )
+
+```
+
+The per-sample scores are saved to Excel.
+
+```{r}
+write.xlsx(a4_tab,
+           "../Results/panel_tests.xlsx",
+           rownames=FALSE)
+```
+
+```{r}
+sc_long <- as.data.frame(scores) %>%
+  dplyr::mutate(Group = cd$Group, Diet = cd$Diet, Sex = cd$Sex) %>%
+  tidyr::pivot_longer(dplyr::all_of(colnames(scores)),
+                      names_to = "panel", values_to = "score") %>%
+  dplyr::mutate(panel = factor(panel, levels = colnames(scores)))
+```
+
+```{r}
+save(sc_long,file="../Results/figures/FS4_data_exploratory.RData")
+```
+
+## A4: Male/Female Liver Panel Score
+
+Panel scores (the mean z-score per sample, defined above) are used to test whether whole biological programs respond to diet differently in the two sexes.
+
+`test_pairwise()` fits a linear model score ~ Diet × Sex + Date for one panel, estimates the model-adjusted mean of each of the four Diet × Sex groups (`emmeans`), and compares all six pairs of groups, with Tukey correction for the six comparisons. This answers questions such as "does diet change the score in males?" directly.
+
+```{r}
+
+# pairwise comparisons of the 4 Diet x Sex cells for one panel
+test_pairwise <- function(sc, name, cd) {
+  fit <- lm(sc ~ Diet * Sex + Date, data = cbind(cd, sc = sc))
+
+  # estimated marginal means for each Diet x Sex combination
+  emm <- emmeans(fit, ~ Diet * Sex)
+
+  # all pairwise contrasts, Tukey-adjusted
+  pw <- as.data.frame(pairs(emm, adjust = "tukey"))
+
+  data.frame(panel = name, pw)
+}
+
+```
+
+```{r}
+program_panels <- c("1a_male_liver", "1b_female_liver", "1c_GH_STAT5")
+
+# score = mean z-score of gene panels for each samples
+scores <- sapply(program_panels, function(nm) {
+   colMeans(z[panels[[nm]], , drop = FALSE], na.rm = TRUE)
+})
+ 
+colnames(scores) <- program_panels
+
+# masculinization index: 
+# male-female program (1 axis, direct feminization test)
+scores <- cbind(scores,
+                masc_index = scores[, "1a_male_liver"] - scores[, "1b_female_liver"])
+
+# lm score ~ Diet * Sex + Date  for each panel
+test_program <- function(sc, name, cd) {
+  fit <- lm(sc ~ Diet * Sex + Date, data = cbind(cd, sc = sc))
+  co  <- summary(fit)$coefficients # coefficient
+  int <- grep(":", rownames(co), value = TRUE)[1]     # DietGFD:SexM
+  data.frame(
+    panel        = name,
+    Sex_M_est    = co["SexM", "Estimate"],            # validation
+    Sex_M_p      = co["SexM", "Pr(>|t|)"],
+    Diet_in_F_est= co["DietGFD", "Estimate"],         # female diet effect
+    Diet_in_F_p  = co["DietGFD", "Pr(>|t|)"],
+    Interaction_est = co[int, "Estimate"],            # interaction
+    Interaction_p   = co[int, "Pr(>|t|)"]
+  )
+}
+
+# bind all results
+a4_tab <- do.call(rbind, 
+                  lapply(colnames(scores),
+                         function(nm) test_program(scores[, nm], nm, cd)))
+
+a4_tab$Interaction_padj <- p.adjust(a4_tab$Interaction_p, "BH")
+print(a4_tab, digits = 3, row.names = FALSE)
+
+# group means
+grp_means <- aggregate(scores, list(Group = cd$Group), mean)
+grp_means %>% 
+  kable(
+    caption = "Group means for each panel",
+    booktabs = TRUE,
+    align = "llcccccc"
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position"),               
+    bootstrap_options = c("striped", "hover", "condensed")  
+  )
+```
+
+```{r}
+test_program <- function(sc, name, cd) {
+  fit <- lm(sc ~ Diet * Sex + Date, data = cbind(cd, sc = sc))
+  emm <- emmeans(fit, ~ Diet * Sex)
+  # cell order in emm: SD_F, GFD_F, SD_M, GFD_M  (check with print(emm))
+
+  ctr <- list(
+    diet_in_F   = c(-1,  1,  0, 0),   # GFD_F - SD_F
+    diet_in_M   = c( 0,  0, -1, 1),   # GFD_M - SD_M
+    sex_in_SD   = c(-1,  0,  1, 0),   # SD_M  - SD_F
+    sex_in_GFD  = c( 0, -1,  0, 1),   # GFD_M - GFD_F
+    interaction = c( 1, -1, -1, 1)    # (GFD_M - SD_M) - (GFD_F - SD_F)
+  )
+
+  res <- summary(contrast(emm, method = ctr, adjust = "none"),
+                 infer = TRUE, level = 0.95)
+
+  data.frame(
+    Panel      = name,
+    Contrast   = res$contrast,
+    Estimate   = res$estimate,
+    SE         = res$SE,
+    df         = res$df,
+    t          = res$t.ratio,
+    p          = res$p.value,
+    CI_lower   = res$lower.CL,
+    CI_upper   = res$upper.CL
+  )
+}
+
+a4_tab <- do.call(rbind,
+                  lapply(colnames(scores),
+                         function(nm) test_program(scores[, nm], nm, cd)))
+
+a4_tab %>%
+  kable(
+    caption = "Diet and sex effects on liver program scores. Linear model score ~ Diet × Sex + Date; estimates are differences in mean z-score (GFD − SD for diet, M − F for sex; interaction = diet effect in males − diet effect in females), with unadjusted two-sided p values and 95% confidence intervals.",
+    digits   = 3,
+    booktabs = TRUE,
+    align    = "llccccccc"
+  ) %>%
+  kable_styling(
+    latex_options     = c("hold_position"),
+    bootstrap_options = c("striped", "hover", "condensed")
+  )
+```
+
+The per-sample scores are saved to Excel.
+
+```{r}
+write.xlsx(scores %>% as.data.frame() %>% rownames_to_column("SampleID"),
+           "../Results/liver_panel_scores.xlsx",
+           rownames=FALSE)
+```
+
+All pairwise group comparisons for every score in this section. `p.value` is Tukey-adjusted within a panel; `p.adj` additionally applies BH correction across all contrasts of this section.
+
+```{r}
+# run for every panel (including masc_index)
+a4_pairwise <- do.call(rbind,
+                       lapply(colnames(scores),
+                              function(nm) test_pairwise(scores[, nm], nm, cd)))
+
+a4_pairwise$p.adj <- p.adjust(a4_pairwise$p.value, method = "BH")
+
+a4_pairwise %>% 
+  kable(
+    caption = "Pairwise comparisons",
+    booktabs = TRUE,
+    align = "llcccccc"
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position"),               
+    bootstrap_options = c("striped", "hover", "condensed")  
+  )
+```
+
+### Visualization
+
+Boxplots of each score by diet, separately for females and males. The stars show a simple Wilcoxon test of GFD vs SD within each sex. 
+
+```{r,fig.width=5,fig.height=8}
+sc_long <- as.data.frame(scores) %>%
+  dplyr::mutate(Group = cd$Group, Diet = cd$Diet, Sex = cd$Sex) %>%
+  tidyr::pivot_longer(dplyr::all_of(colnames(scores)),
+                      names_to = "panel", values_to = "score") %>%
+  dplyr::mutate(panel = factor(panel, levels = colnames(scores)))
+
+pvals <- sc_long %>%
+  group_by(panel, Sex) %>%
+  summarise(p = wilcox.test(score ~ Diet)$p.value,
+            top = max(score, na.rm = TRUE),
+            rng = diff(range(score, na.rm = TRUE)),
+            .groups = "drop") %>%
+  mutate(y = top - 0 * rng,          
+         label = ifelse(p < 0.001, "***",
+                 ifelse(p < 0.01,  "**",
+                 ifelse(p < 0.05,  "*", "ns"))))
+
+p <- ggplot(sc_long, aes(Diet, score)) +
+  geom_boxplot(aes(fill = Group), outlier.size = 0.8, alpha = 0.85) +
+  geom_point(position = position_jitter(width = 0.12), size = 0.9, alpha = 0.5) +
+  facet_grid(panel ~ Sex, scales = "free_y", switch = "y") +
+  scale_fill_manual(values = group_colours) +
+  geom_text(data = pvals, aes(x = 1.5, y = y, label = label),
+            inherit.aes = FALSE, size = 4) +
+  labs(x = NULL, y = "Score (mean z-score of panel)",
+       title = "Liver programs per Group")
+p
+```
+
+```{r}
+save(sc_long,pvals,file="../Results/figures/F5C_data_exploratory.RData")
+```
+
+
+## A5: Panels for the Order and Starvation Effects
+
+**Panels 2-4**
+
+The same scoring approach is applied to panels that respond to collection time and feeding state: immediate-early/stress genes (2), glucocorticoid targets (3a), fasting (3b), lipogenesis (3c) and the circadian clock (4). Each score is modelled as score ~ Diet × Sex + Date, and the interaction p-values are BH-corrected across these five panels.
+
+```{r}
+a5_panels <- c("2_IEG_stress", "3a_GC_targets", "3b_fasting",
+               "3c_lipogenesis", "4_circadian")
+
+scores5 <- sapply(a5_panels, function(nm) {
+ colMeans(z[panels[[nm]], , drop = FALSE], na.rm = TRUE) 
+})
+
+colnames(scores5) <- a5_panels
+
+# lm score ~ Diet * Sex + Date  for each panel
+test_program <- function(sc, name, cd) {
+  fit <- lm(sc ~ Diet * Sex + Date, data = cbind(cd, sc = sc))
+  co  <- summary(fit)$coefficients # coefficient
+  int <- grep(":", rownames(co), value = TRUE)[1]     # DietGFD:SexM
+  data.frame(
+    panel        = name,
+    Sex_M_est    = co["SexM", "Estimate"],            # validation
+    Sex_M_p      = co["SexM", "Pr(>|t|)"],
+    Diet_in_F_est= co["DietGFD", "Estimate"],         # female diet effect
+    Diet_in_F_p  = co["DietGFD", "Pr(>|t|)"],
+    Interaction_est = co[int, "Estimate"],            # interaction
+    Interaction_p   = co[int, "Pr(>|t|)"]
+  )
+}
+
+# bind all results
+a5_tab <- do.call(rbind, 
+                  lapply(colnames(scores5),
+                         function(nm) test_program(scores5[, nm], nm, cd)))
+
+a5_tab$Interaction_padj <- p.adjust(a5_tab$Interaction_p, "BH")
+print(a5_tab, digits = 3, row.names = FALSE)
+
+# helpers for inline numbers in the interpretation text
+val <- function(tab, panel, col, d = 2) signif(tab[tab$panel == panel, col], d)
+pw  <- function(tab, panel, contrast, d = 2) 
+  signif(tab[tab$panel == panel & tab$contrast == contrast, "p.adj"], d)
+
+# group means
+grp_means <- aggregate(scores5, list(Group = cd$Group), mean)
+grp_means %>% 
+  kable(
+    caption = "Group means for each panel",
+    booktabs = TRUE,
+    align = "llcccccc"
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position"),               
+    bootstrap_options = c("striped", "hover", "condensed")  
+  )
+```
+
+```{r}
+write.xlsx(scores5 %>% as.data.frame() %>% rownames_to_column("SampleID"),
+           "../Results/order_starvation_scores.xlsx",
+           rownames=FALSE)
+```
+
+All pairwise group comparisons for the A5 panels, with Tukey correction within a panel (`p.value`) and BH correction across all A5 contrasts (`p.adj`).
+
+```{r}
+# run for every A5 panel
+a5_pairwise <- do.call(rbind,
+                       lapply(colnames(scores5),
+                              function(nm) test_pairwise(scores5[, nm], nm, cd)))
+
+a5_pairwise$p.adj <- p.adjust(a5_pairwise$p.value, method = "BH")
+
+a5_pairwise %>% 
+  kable(
+    caption = "Pairwise comparisons",
+    booktabs = TRUE,
+    align = "llcccccc"
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position"),               
+    bootstrap_options = c("striped", "hover", "condensed")  
+  )
+```
+
+### Visualization
+
+```{r,fig.width=5,fig.height=8}
+# Boxplot
+
+sc_long <- as.data.frame(scores5) %>%
+  dplyr::mutate(Group = cd$Group, Diet = cd$Diet, Sex = cd$Sex) %>%
+  tidyr::pivot_longer(dplyr::all_of(colnames(scores5)),
+                      names_to = "panel", values_to = "score") %>%
+  dplyr::mutate(panel = factor(panel, levels = colnames(scores5)))
+
+pvals <- sc_long %>%
+  group_by(panel, Sex) %>%
+  summarise(p = wilcox.test(score ~ Diet)$p.value,
+            top = max(score, na.rm = TRUE),
+            rng = diff(range(score, na.rm = TRUE)),
+            .groups = "drop") %>%
+  mutate(y = top - 0 * rng,          
+         label = ifelse(p < 0.001, "***",
+                 ifelse(p < 0.01,  "**",
+                 ifelse(p < 0.05,  "*", "ns"))))
+
+p <- ggplot(sc_long, aes(Diet, score)) +
+  geom_boxplot(aes(fill = Group), outlier.size = 0.8, alpha = 0.85) +
+  geom_point(position = position_jitter(width = 0.12), size = 0.9, alpha = 0.5) +
+  facet_grid(panel ~ Sex, scales = "free_y", switch = "y") +
+  scale_fill_manual(values = group_colours) +
+  geom_text(data = pvals, aes(x = 1.5, y = y, label = label),
+            inherit.aes = FALSE, size = 4) +
+  labs(x = NULL, y = "Score (mean z-score of panel)",
+       title = "Liver programs per Group")
+p
+
+```
+
+```{r}
+save(sc_long,pvals,file="../Results/figures/F5D_data_exploratory.RData")
+```
+
+::: {.callout-note title="Interpretation"}
+
+**3c_lipogenesis** (interaction est = `r val(a5_tab, "3c_lipogenesis", "Interaction_est")`, padj = `r val(a5_tab, "3c_lipogenesis", "Interaction_padj")`)
+
+This is the only panel with a significant Diet×Sex interaction after BH correction. Diet affects the lipogenesis/cholesterol-synthesis program differently in males and females.
+
+In females the diet effect is flat (est = `r val(a5_tab, "3c_lipogenesis", "Diet_in_F_est")`, p = `r val(a5_tab, "3c_lipogenesis", "Diet_in_F_p")`). The negative interaction therefore means that GFD **lowers** lipogenesis in males, while females do not change (pairwise SD M vs GFD M: padj = `r pw(a5_pairwise, "3c_lipogenesis", "SD M - GFD M")`).
+
+**4_circadian** (interaction est = `r val(a5_tab, "4_circadian", "Interaction_est")`, p = `r val(a5_tab, "4_circadian", "Interaction_p")`, padj = `r val(a5_tab, "4_circadian", "Interaction_padj")`)
+
+No significant interaction. The other timing- and feeding-sensitive panels (IEG/stress, GC targets, fasting) also show no significant interaction after correction.
+
+:::
+
+## A6: Liver damage markers
+
+**Panels 5-8**
+
+The same scoring approach is applied to the liver-damage panels: fibrosis (5), ductular reaction (6), inflammation (7) and cholestasis/bile-acid handling (8). Each score is modelled as score ~ Diet × Sex + Date, with BH correction of the interaction p-values across the four panels.
+
+```{r}
+a6_panels <- c("5_fibrosis", "6_ductular", "7_inflammation", "8_cholestasis")
+
+scores6 <- sapply(a6_panels, function(nm) {
+ colMeans(z[panels[[nm]], , drop = FALSE], na.rm = TRUE) 
+})
+
+colnames(scores6) <- a6_panels
+
+# lm score ~ Diet * Sex + Date  for each panel
+test_program <- function(sc, name, cd) {
+  fit <- lm(sc ~ Diet * Sex + Date, data = cbind(cd, sc = sc))
+  co  <- summary(fit)$coefficients # coefficient
+  int <- grep(":", rownames(co), value = TRUE)[1]     # DietGFD:SexM
+  data.frame(
+    panel        = name,
+    Sex_M_est    = co["SexM", "Estimate"],            # validation
+    Sex_M_p      = co["SexM", "Pr(>|t|)"],
+    Diet_in_F_est= co["DietGFD", "Estimate"],         # female diet effect
+    Diet_in_F_p  = co["DietGFD", "Pr(>|t|)"],
+    Interaction_est = co[int, "Estimate"],            # interaction
+    Interaction_p   = co[int, "Pr(>|t|)"]
+  )
+}
+
+# bind all results
+a6_tab <- do.call(rbind, 
+                  lapply(colnames(scores6),
+                         function(nm) test_program(scores6[, nm], nm, cd)))
+
+a6_tab$Interaction_padj <- p.adjust(a6_tab$Interaction_p, "BH")
+print(a6_tab, digits = 3, row.names = FALSE)
+
+# group means
+grp_means <- aggregate(scores6, list(Group = cd$Group), mean)
+grp_means %>% 
+  kable(
+    caption = "Group means for each panel",
+    booktabs = TRUE,
+    align = "llcccccc"
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position"),               
+    bootstrap_options = c("striped", "hover", "condensed")  )
+```
+
+```{r}
+write.xlsx(scores6 %>% as.data.frame() %>% rownames_to_column("SampleID"),
+           "../Results/liver_damage_scores.xlsx",
+           rownames=FALSE)
+```
+
+```{r}
+# run for every A6 panel
+a6_pairwise <- do.call(rbind,
+                       lapply(colnames(scores6),
+                              function(nm) test_pairwise(scores6[, nm], nm, cd)))
+
+a6_pairwise$p.adj <- p.adjust(a6_pairwise$p.value, method = "BH")
+
+a6_pairwise %>% 
+  kable(
+    caption = "Pairwise comparisons",
+    booktabs = TRUE,
+    align = "llcccccc"
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position"),               
+    bootstrap_options = c("striped", "hover", "condensed")  
+  )
+```
+
+### Visualization
+
+Boxplots of each A6 score by diet within each sex, with unadjusted Wilcoxon stars as a visual guide.
+
+```{r,fig.width=5,fig.height=8}
+# Boxplot
+
+sc_long <- as.data.frame(scores6) %>%
+  dplyr::mutate(Group = cd$Group, Diet = cd$Diet, Sex = cd$Sex) %>%
+  tidyr::pivot_longer(dplyr::all_of(colnames(scores6)),
+                      names_to = "panel", values_to = "score") %>%
+  dplyr::mutate(panel = factor(panel, levels = colnames(scores6)))
+
+pvals <- sc_long %>%
+  group_by(panel, Sex) %>%
+  summarise(p = wilcox.test(score ~ Diet)$p.value,
+            top = max(score, na.rm = TRUE),
+            rng = diff(range(score, na.rm = TRUE)),
+            .groups = "drop") %>%
+  mutate(y = top - 0 * rng,          
+         label = ifelse(p < 0.001, "***",
+                 ifelse(p < 0.01,  "**",
+                 ifelse(p < 0.05,  "*", "ns"))))
+
+p <- ggplot(sc_long, aes(Diet, score)) +
+  geom_boxplot(aes(fill = Group), outlier.size = 0.8, alpha = 0.85) +
+  geom_point(position = position_jitter(width = 0.12), size = 0.9, alpha = 0.5) +
+  facet_grid(panel ~ Sex, scales = "free_y", switch = "y") +
+  scale_fill_manual(values = group_colours) +
+  geom_text(data = pvals, aes(x = 1.5, y = y, label = label),
+            inherit.aes = FALSE, size = 4) +
+  labs(x = NULL, y = "Score (mean z-score of panel)",
+       title = "Liver programs per Group")
+p
+
+```
+
+::: {.callout-note title="Interpretation"}
+
+No panel survives BH correction on the interaction (Interaction_padj: fibrosis `r val(a6_tab, "5_fibrosis", "Interaction_padj")`, ductular `r val(a6_tab, "6_ductular", "Interaction_padj")`, cholestasis `r val(a6_tab, "8_cholestasis", "Interaction_padj")`, inflammation `r val(a6_tab, "7_inflammation", "Interaction_padj")`). There is no robust sex-dependent diet effect on the liver-damage panels.
+
+In the ductular panel, the group means suggest a non-significant opposite trend: the score goes down in males on GFD and up in females on GFD. The cholestasis panel does not show this pattern.
+
+Two pairwise results stand out:
+
+- **Fibrosis markers are lower in males on GFD** than in males on SD (padj = `r pw(a6_pairwise, "5_fibrosis", "SD M - GFD M")`).
+- **Fibrosis markers are lower in males than in females on SD** (padj = `r pw(a6_pairwise, "5_fibrosis", "SD F - SD M")`), a sex difference in fibrosis-marker expression.
+
+:::
+
+**Save the pairwise tests**
+
+```{r}
+pairwise_table <- rbind(a4_pairwise,
+                        a5_pairwise,
+                        a6_pairwise)
+
+write.xlsx(pairwise_table,file = "../Results/pairwise_panels.xlsx")
+
+pairwise_table %>% dplyr::filter(p.adj<0.05) %>% 
+  kable(
+    caption = "Pairwise test of selected panels",
+    booktabs = TRUE,
+    align = "llcccccc"
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position"),               
+    bootstrap_options = c("striped", "hover", "condensed")  
+  )
+```
+
+# Quick summary
+
+**Sex dominates, but diet acts through sex**
+
+Sex explains ~`r round(100 * pmv["Sex", "R2"])`% of transcriptome variance (PERMANOVA p = `r pmv["Sex", "Pr(>F)"]`), and there is a significant Diet×Sex interaction (R² = `r round(100 * pmv["Diet:Sex", "R2"], 1)`%, p = `r pmv["Diet:Sex", "Pr(>F)"]`): diet reshapes the liver differently in males and females.
+
+**The diet response is essentially male-only**
+
+`r nrow(sig_diet_M)` diet-responsive genes in males vs `r nrow(sig_diet_F)` in females, and diet inflates sex differences about `r round(nrow(sig_sex_GFD)/nrow(sig_sex_SD))`-fold (`r nrow(sig_sex_GFD)` sex genes under GFD vs `r nrow(sig_sex_SD)` under SD).
+
+**GFD lowers lipogenesis and fibrosis markers in males**
+
+The lipogenesis/cholesterol-synthesis panel is the only panel with a significant Diet×Sex interaction; GFD lowers it in males only. Fibrosis markers are also lower in GFD males than in SD males.
+
+**Main caveat: collection order**
+
+GFD males were always collected last, and the male diet genes drift with collection order more than background genes. The male-specific response is consistent across analyses, but part of it may reflect time of collection rather than diet.
+

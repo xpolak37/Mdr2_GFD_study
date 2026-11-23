@@ -1,0 +1,194 @@
+---
+title: "PSC mice P76_3 part1"
+subtitle: "Rnaseq dataset"
+format: 
+  html:  
+    embed-resources: true
+    keep-md: false
+    toc: true
+    toc-expand: 3
+    toc-depth: 6
+    toc-location: left
+    number-sections: true
+    number-depth: 6
+    code-fold: show
+    code-tools: true
+    code-summary: "Open code"
+    grid: 
+      body-width: 1000px
+      sidebar-width: 600px
+      margin-width: 100px
+execute: 
+  warning: true
+  print: true
+  echo: true
+editor: source
+project:
+  type: default
+  output-dir: output
+fontsize: 12 px
+---
+
+# Introduction
+
+This report presents a preliminary transcriptomic analysis of liver samples from a PSC mouse model (experiment P76_3), asking how diet and sex jointly shape hepatic gene expression. 
+
+RNA-seq data was processed using custom bioinformatic pipeline available at https://github.com/xpolak37/RNAseq_workflow. 
+
+Data from 44 animals (SD: 10F/11M; GFD: 11F/12M) were modeled in DESeq2 using the design Date + Diet + Sex + Diet:Sex, with SD and female as reference levels; the Diet×Sex interaction is the primary term of interest, since it tests whether diet acts differently in the two sexes rather than assuming a single "overall" diet effect. 
+
+After filtering to genes with ≥5 counts in at least one full group, 16602 genes were retained. 
+
+The workflow combines global structure (PCA, sample-distance heatmap, PERMANOVA), targeted differential expression, curated gene panels (masculinization, lipogenesis, liver-damage, bile-acid), integration with serum bile-acid phenotypes and clinical parameters, and pathway enrichment (Hallmark, KEGG, Reactome). 
+
+One caveat runs through the whole analysis: collection order/date carries circadian (time-of-day) information and is partly entangled with the biological signal.
+
+```{r}
+source("custom_functions_rnaseq.R")
+```
+
+# Import
+
+Two inputs are loaded:
+
+- **Gene-level expression** (`tpm_data.tsv`): TPM values for every gene (rows) in every sample (columns), produced by the RNA-seq pipeline. TPM (transcripts per million) corrects for sequencing depth and gene length, so values are comparable between samples and between genes.
+- **Sample metadata** (`metadata_P076v4.xlsx`): one row per animal with diet, sex, collection date and other annotations. Rows without an RNA-seq sample ID (`SampleIAB`) are dropped, a combined `Group` label (e.g. `GFD_M`) is created from Diet and Sex, and `SampleID` is set to the RNA-seq sample ID so metadata rows can be matched to expression columns.
+
+```{r}
+# load gene level data
+gene_df <- fread("../../Data/tpm_data.tsv") %>% as.data.frame()
+
+# load metadata
+sample_metadata <- read.xlsx("../../Data/metadata_P076v3.xlsx",detectDates = TRUE) %>%
+  dplyr::filter(!is.na(SampleIAB)) %>%
+  dplyr::mutate(Group=paste(Diet,Sex,sep = "_")) %>% 
+  dplyr::mutate(SampleID=SampleIAB)
+```
+
+
+```{r}
+group_colours <- c("GFD_F"="#e59866",
+                   "GFD_M"= "#7fb3d5",
+                   "SD_F"="#b03a2e",
+                  "SD_M"="#1c4c78")
+```
+
+
+# Number of identified genes
+
+For each sample, the chunk below counts how many genes have expression above zero (TPM > 0). The non-sample columns of the expression table (the gene identifier columns) are excluded first. A sample with clearly fewer detected genes than the rest would suggest low library complexity or a technical problem.
+
+
+```{r}
+sample_metadata$number_of_genes <- apply(gene_df[,-c(45,46)],2,function(x) sum(as.numeric(x)>0,na.rm = TRUE))
+```
+
+The bar plot shows the number of detected genes per sample, coloured by group. Samples should look broadly similar; no group should be systematically lower, since that would be a technical difference that could masquerade as biology.
+
+```{r}
+p <- ggplot(sample_metadata) + 
+  geom_col(aes(x=SampleID,y=number_of_genes,fill=Group)) + 
+  scale_fill_manual(values = group_colours) + 
+  ylab("Number of identified genes") + xlab("Sample") 
+
+p <- ggtheme(p) + 
+  theme(axis.text.x = element_text(angle=45,hjust = 1,size = 5))
+
+p
+```
+
+# Sequencing depth
+
+Sequencing depth is the total number of reads obtained for each sample (taken from the metadata). Uneven depth is expected to some degree and is corrected by normalization, but very shallow samples carry less information and noisier estimates for lowly expressed genes. As above, depth should not differ systematically between groups.
+
+```{r}
+p <- ggplot(sample_metadata) + 
+  geom_col(aes(x=SampleID,y=Seq_depth,fill=Group)) + 
+  scale_fill_manual(values = group_colours) + 
+  ylab("Sequencing depth") + xlab("Sample") 
+
+p <- ggtheme(p) + 
+  theme(axis.text.x = element_text(angle=45,hjust = 1,size = 5))
+
+p
+```
+
+# Exploratory data analysis
+
+## Table 1
+
+```{r}
+df <- tableone::CreateTableOne(vars = c(colnames(sample_metadata)[c(-1,-2,-11,-13)]),
+                                data = sample_metadata,
+                                factorVars = "Group",
+                                test = FALSE)
+df_overall <- print(df, showAllLevels = TRUE, quote = FALSE, noSpaces = TRUE, printToggle = FALSE)
+
+df_overall %>% kable(
+    caption = "Table 1",
+    digits  = 8,
+    booktabs = TRUE,
+    align = "ccc"
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position"),               
+    bootstrap_options = c("striped", "hover", "condensed")  
+  ) 
+```
+
+## PCA
+
+```{r,fig.width=5,fig.height=4}
+### sample to sample PCA
+pca_data <- as.data.frame(t(gene_df[,-c(45,46)]))
+pca_data_filtered <- pca_data[, apply(pca_data, 2, var) != 0] 
+
+p12 <- pca_plot(pca_data_filtered,sample_metadata,colors = group_colours,
+                axis = c("PC1","PC2"))
+p23 <- pca_plot(pca_data_filtered,sample_metadata,colors = group_colours,
+                axis = c("PC2","PC3"))
+p13 <- pca_plot(pca_data_filtered,sample_metadata,colors = group_colours,
+                axis = c("PC1","PC3"))
+
+ggplotly(p12, tooltip = "text")
+```
+
+```{r,fig.width=12,fig.height=4}
+
+p <- wrap_plots(p12,p23,p13,guides = "collect")
+
+p
+```
+
+## Heatmap
+
+The heatmap shows expression of all genes (rows) across all samples (columns). Expression is log2(TPM + 1)-transformed, so that a few very highly expressed genes do not dominate the colour scale; adding 1 avoids taking the log of zero. Genes are kept in their original order (not clustered), while samples are hierarchically clustered, so samples with similar profiles end up next to each other. 
+
+```{r,fig.height=5,fig.width=10}
+library(pheatmap)
+p_df <- gene_df[,-c(45)] %>%
+  `rownames<-`(NULL) %>%
+  column_to_rownames("gene_id")
+
+p_df <- log2(p_df+1)
+
+ann_df <- sample_metadata %>% dplyr::select(SampleID,Group) %>%
+  column_to_rownames("SampleID")
+
+ann_colors <- list(
+  "Group"=unique(group_colours)
+)
+names(ann_colors[["Group"]]) <- unique(names(group_colours))
+
+p <- pheatmap(p_df,cluster_rows = FALSE,show_rownames = FALSE,
+              annotation_col = ann_df,annotation_colors = ann_colors)
+
+```
+
+
+::: {.callout-note title="Interpretation"}
+
+On variance-stabilized (VST) expression, sex is the single most visible axis of variation in both the PCA and the sample-distance heatmap, with samples separating primarily by sex rather than by diet or date. 
+
+:::
+

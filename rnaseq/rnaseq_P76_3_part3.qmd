@@ -1,0 +1,1168 @@
+---
+title: "PSC mice P76_3"
+subtitle: "Rnaseq dataset part3"
+format: 
+  html:  
+    embed-resources: true
+    keep-md: false
+    toc: true
+    toc-expand: 3
+    toc-depth: 6
+    toc-location: left
+    number-sections: true
+    number-depth: 6
+    code-fold: show
+    code-tools: true
+    code-summary: "Open code"
+    grid: 
+      body-width: 1000px
+      sidebar-width: 600px
+      margin-width: 100px
+execute: 
+  warning: true
+  print: true
+  echo: true
+editor: source
+project:
+  type: default
+  output-dir: output
+fontsize: 12 px
+---
+
+# Introduction
+
+This report presents a preliminary transcriptomic analysis of liver samples from a PSC mouse model (experiment P76_3), asking how diet and sex jointly shape hepatic gene expression. 
+
+RNA-seq data was processed using custom bioinformatic pipeline available at https://github.com/xpolak37/RNAseq_workflow. 
+
+Data from 44 animals (SD: 10F/11M; GFD: 11F/12M) were modeled in DESeq2 using the design Date + Diet + Sex + Diet:Sex, with SD and female as reference levels; the Diet×Sex interaction is the primary term of interest, since it tests whether diet acts differently in the two sexes rather than assuming a single "overall" diet effect. 
+
+After keeping genes detected (non-zero count) in at least 5 samples of at least one Diet × Sex group, 25981 genes were retained (section 3.1). 
+
+This part covers the integration of liver expression with serum bile acids (A8) and clinical liver markers (B2), and pathway enrichment (Hallmark, KEGG, Reactome). Global structure, differential expression and the gene panels are described in part 2. 
+
+One caveat runs through the whole analysis: the four groups were collected in blocks (SD_F first, GFD_M last; see part 2, A3), so collection order, which carries time-of-day and feeding-state information, is strongly confounded with group.
+
+```{r}
+source("custom_functions_rnaseq.R")
+```
+
+# Import
+
+
+Two inputs are loaded:
+
+- **Gene-level expression** (`tpm_data.tsv`): TPM values per gene and sample, produced by the RNA-seq pipeline.
+- **Sample metadata** (`metadata_P076v3.xlsx`): one row per animal with diet, sex, collection date/order and other annotations. Rows without an RNA-seq sample ID (`SampleIAB`) are dropped, a combined `Group` label (e.g. `GFD_M`) is created from Diet and Sex, and `SampleID` is set to the RNA-seq sample ID so that metadata rows can be matched to expression data.
+
+```{r,collapse=FALSE}
+# load gene level data
+gene_df <- fread("../../Data/tpm_data.tsv") %>% as.data.frame()
+
+# load metadata
+sample_metadata <- read.xlsx("../../Data/metadata_P076v3.xlsx",detectDates = TRUE) %>%
+  dplyr::filter(!is.na(SampleIAB)) %>%
+  dplyr::mutate(Group=paste(Diet,Sex,sep = "_")) %>% 
+  dplyr::mutate(SampleID=SampleIAB)
+```
+
+
+```{r}
+# assign colors to groups
+group_colours <- c("GFD_F"="#e59866",
+                   "GFD_M"= "#7fb3d5",
+                   "SD_F"="#b03a2e",
+                  "SD_M"="#1c4c78")
+```
+
+
+# Analysis
+
+This part repeats the data preparation from part 2 so that it can run on its own. The transcript import itself was run in part 2 and saved; it is loaded here.
+
+- `tx2gene` is a transcript-to-gene lookup (`tx2gene.tsv`) built from the same Ensembl GRCm39 annotation that was used for the Salmon index, including gene symbols.
+- `tximport()` reads the Salmon quantification of every sample and sums transcript-level estimates into gene-level estimated counts, keeping average transcript lengths for DESeq2 to use as a correction. Transcript version suffixes (e.g. `.3`) are ignored so that IDs match the annotation.
+
+**Load dataset**
+
+The saved import is loaded, and the metadata variables are converted to factors with explicit reference levels: **SD** for Diet and **F** for Sex. Collection date is also converted to a factor. The DESeq2 object is then built with the design `~ Date + Diet * Sex`, which expands to Date + Diet + Sex + Diet:Sex.
+
+```{r}
+load("../Results/transcript_import.RData")
+
+# metadata to factors
+sample_metadata <- sample_metadata %>%
+  mutate(
+    Diet  = factor(Diet, levels = c("SD", "GFD")), 
+    Sex   = factor(Sex,  levels = c("F", "M")),        
+    Group = factor(paste(Diet, Sex, sep = "_")),
+    Date = factor(gsub("-","_",Date))
+  )
+
+# Build DESeq2 object (factorial design)
+dds <- DESeqDataSetFromTximport(
+  txi,
+  colData = sample_metadata,
+  design  = ~ Date + Diet * Sex            # = Diet + Sex + Diet:Sex
+)
+```
+
+## Filter
+
+Genes that are barely detected are removed. A gene is kept if it has a non-zero count in at least 5 samples of at least one group (SD_F, SD_M, GFD_F or GFD_M), so genes switched on in only one condition are retained.
+
+```{r}
+# genes detected (count > 0) in >= 5 samples of at least one group
+min_count <- 5
+grp <- sample_metadata$Group
+keep <- sapply(levels(factor(grp)), function(g) {
+  rowSums(counts(dds)[, grp == g, drop = FALSE] > 0) >= min_count
+})
+keep <- rowSums(keep) >= 1   # passes in at least one group
+dds  <- dds[keep, ]
+
+cat(sum(keep), "genes kept after filtering\n")
+
+```
+
+## Run Deseq
+
+Design: Date + Diet + Sex + Diet:Sex. 
+
+Reference factors:
+Diet: SD
+Sex: F
+
+The full model is:
+
+**Date** - a covariate we're adjusting for (collection date)
+**Diet** - main effect of diet (Effect of diet on reference SEX=F)
+**Sex** - main effect of sex  (Effect of sex on reference Diet=SD)
+**Diet:Sex** - the interaction: whether diet's effect on expression differs between sexes (or equivalently, whether the sex difference depends on diet). This is usually the term we care about.
+
+```{r}
+dds <- DESeq(dds)
+vsd <- vst(dds, blind = FALSE)
+m  <- assay(vsd)  # genes x samples
+cd <- as.data.frame(colData(dds))
+cd$Order <- as.numeric(cd$Order)
+```
+
+
+## Date + Diet * Sex
+
+**GFD vs SD (diet effect)**
+
+- **IN FEMALES** - the diet effect in females is captured entirely by the main-effect coefficient, because females are the reference (single coef is enough)
+
+- **IN MALES**- there's no single coefficient for "diet effect in males." We have to build it by adding the female diet effect plus the male-specific adjustment: 
+
+DietGFD.SexM = (DIET_MALES) - (DIET_FEMALES), so then: 
+
+DIET_MALES = DIET_FEMALES + DietGFD.SexM 
+
+**M vs F (Sex effect)**
+
+- **IN SD** - we have it already in the model: Sex_M_vs_F is effect of sex in reference diet (SD)
+
+- **IN GFD**- SEX_GFD = SEX_SD + DietGFD.SexM 
+
+```{r}
+alpha <- 0.05
+lfc   <- 1          
+
+# ashr: it shrinks single coefficients AND summed contrasts
+
+# GFD vs SD (diet effect)
+## in females
+res_diet_in_F  <- lfcShrink(dds, coef = "Diet_GFD_vs_SD", type = "ashr") 
+
+## in males
+res_diet_in_M  <- lfcShrink(
+  dds, contrast = list(c("Diet_GFD_vs_SD","DietGFD.SexM")),
+  type = "ashr")              
+
+# M vs F (sex effect)
+
+## IN SD
+res_sex_in_SD  <- lfcShrink(dds, coef = "Sex_M_vs_F", type = "ashr")          
+
+## IN GFD
+res_sex_in_GFD <- lfcShrink(
+  dds, contrast = list(c("Sex_M_vs_F","DietGFD.SexM")),
+  type = "ashr")                                         
+
+# Interaction: does the diet effect depend on sex?
+res_int <- lfcShrink(dds, coef = "DietGFD.SexM", type = "ashr")
+
+# Summarise significant-gene counts
+summarise_res <- function(res, sym,name) {
+  sig <- subset(as.data.frame(res),
+                !is.na(padj) & padj < alpha & abs(log2FoldChange) >= lfc)
+  message(sprintf("%-24s : %d significant genes", name, nrow(sig)))
+  sig <- sig %>%
+  rownames_to_column("gene_id") %>%     # name the key column correctly
+  left_join(sym, by = "gene_id") 
+ 
+  write.xlsx(sig,paste0("../Results/",name,".xlsx"),rownames=FALSE)
+  return(sig)
+}
+
+# keeps only the columns we pick and collapses the result to unique combinations, throwing away the transcript-level duplication.
+sym <- distinct(tx2gene, gene_id, gene_name)   # lookup 
+
+# summary
+sig_diet_F  <- summarise_res(res_diet_in_F,sym,  "Diet effect in females")
+sig_diet_M  <- summarise_res(res_diet_in_M,sym,  "Diet effect in males")
+sig_sex_SD  <- summarise_res(res_sex_in_SD,sym,  "Sex effect in SD")
+sig_sex_GFD <- summarise_res(res_sex_in_GFD,sym, "Sex effect in GFD")
+sig_int     <- summarise_res(res_int,sym,        "Diet x Sex interaction")
+```
+
+# Building panels
+
+
+Each gene is **z-scored** across samples (centered to mean 0 and scaled to standard deviation 1), so that genes with different expression levels contribute equally when they are averaged into a panel score. `z` is the resulting matrix.
+
+
+```{r}
+vsd <- vst(dds, blind = FALSE)
+m  <- assay(vsd)  # genes x samples
+z <- t(scale(t(m)))
+```
+
+The gene panels are defined by gene symbol, exactly as in part 2:
+
+- All genes of the major urinary protein family (`Mup1`, `Mup2`, …), a classic male-biased liver program, are added to the male-liver panel.
+- Symbols are mapped to Ensembl gene IDs (`sym2id`).
+- A **coverage table** reports, for each panel, how many requested genes are present, which symbols were not found in the annotation, and which were removed by the low-count filter; a case-insensitive search suggests matches for symbols that were not found.
+- `panels` is the final list of gene IDs per panel.
+
+```{r}
+panels_sym <- list(
+  `1a_male_liver`   = c("Hsd3b5","Cyp4a12a","Cyp4a12b","Cyp2d9","Cyp7b1","Slco1a1",
+                        "Elovl3","Nudt7","Ugt2b1","Bcl6"),          
+  `1b_female_liver` = c("Cyp2b9","Cyp3a41a","Cyp3a44","Cyp2a4","Sult3a1","Sult2a1",
+                        "Fmo3","A1bg","Nnmt","Cux2"),
+  `1c_GH_STAT5`     = c("Ghr","Stat5b","Socs2","Cish","Igf1","Igfals","Socs3"),
+  `2_IEG_stress`    = c("Fos","Fosb","Jun","Junb","Jund","Egr1","Atf3","Dusp1",
+                        "Nr4a1","Hspa1a","Hspa1b"),
+  `3a_GC_targets`   = c("Tsc22d3","Fkbp5","Klf15","Sds","Zbtb16","Per1"),
+  `3b_fasting`      = c("Fgf21","Hmgcs2","Cpt1a","Ppargc1a","Pck1","G6pc1",
+                        "Angptl4","Slc25a20"),
+  `3c_lipogenesis`  = c("Fasn","Scd1","Elovl6","Acaca","Srebf1","Mlxipl","Hmgcs1",
+                        "Hmgcr","Sqle","Ldlr","Insig1"),
+  `4_circadian`     = c("Bmal1","Npas2","Nr1d1","Nr1d2","Per1","Per2","Per3","Cry1",
+                        "Cry2","Dbp","Tef","Hlf","Nfil3","Ciart"),
+  `5_fibrosis`      = c("Col1a1","Col1a2","Col3a1","Acta2","Timp1","Timp2","Lox",
+                        "Pdgfrb","Tgfb1","Sparc"),
+  `6_ductular`      = c("Krt19","Krt7","Epcam","Sox9","Spp1","Cldn7","Hnf1b"),
+  `7_inflammation`  = c("Ccl2","Ccl5","Cxcl1","Cxcl9","Tnf","Il1b","Il6","Lcn2",
+                        "Saa1","Saa2","Adgre1","Itgam","Mmp12"),
+  `8_cholestasis`   = c("Cyp7a1","Cyp8b1","Cyp27a1","Cyp2c70","Cyp2a12","Nr0b2",
+                        "Nr1h4","Slc10a1","Abcb11","Abcc3","Abcc4","Slc51a","Slc51b",
+                        "Baat","Abcb4")
+)
+
+# "Mup family "
+mup_syms <- grep("^Mup[0-9]", sym$gene_name, value = TRUE) %>% unique()
+panels_sym[["1a_male_liver"]] <- c(panels_sym[["1a_male_liver"]], mup_syms)
+cat("Mup family notation found in :", length(mup_syms), "genes\n")
+
+# map with gene id and gene name
+sym2id <- function(s) sym$gene_id[match(s, sym$gene_name)]
+
+# QC / coverage-check step: for each gene panel
+# it counts how many of requested genes actually made it into expression data,
+# and reports which genes dropped out and why.
+coverage <- lapply(names(panels_sym), function(nm) {
+  s  <- panels_sym[[nm]]
+  id <- sym2id(s)
+  in_annot <- !is.na(id)
+  in_data  <- in_annot & id %in% rownames(m)
+  data.frame(
+    panel             = nm,
+    requested         = length(s),
+    in_data           = sum(in_data),
+    not_in_annotation = paste(s[!in_annot],            collapse = ", "),
+    filtered_lowcount = paste(s[in_annot & !in_data],  collapse = ", ")
+  )
+}) %>% dplyr::bind_rows()
+
+coverage %>%
+  kable(
+    caption = "Genes detected in our RNAseq dataset",
+    digits  = 8,
+    booktabs = TRUE,
+    align = "llcccccc"
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position"),               
+    bootstrap_options = c("striped", "hover", "condensed")  
+  ) 
+
+# case-insensitive
+missing_all <- unique(unlist(lapply(panels_sym, function(s) s[is.na(sym2id(s))])))
+if (length(missing_all)) {
+  cat("\ncase-insensitive:\n")
+  for (g in missing_all) {
+    hit <- grep(paste0("^", g, "$"), sym$gene_name, ignore.case = TRUE, value = TRUE)
+    if (length(hit)) cat(sprintf("  %-12s -> %s\n", g, paste(hit, collapse = ", ")))
+  }
+}
+
+# final panels
+panels <- lapply(panels_sym, function(s) {
+  id <- sym2id(s); unique(id[!is.na(id) & id %in% rownames(m)])
+})
+```
+
+The sex-specific liver program scores from part 2 (A4) are recomputed here because they are used in the phenotype analysis (B2). Each score is the mean z-score of the panel's genes in a sample; the **masculinization index** is the male-liver score minus the female-liver score (higher = more male-like liver).
+
+```{r}
+program_panels <- c("1a_male_liver", "1b_female_liver", "1c_GH_STAT5")
+
+# score = mean z-score of gene panels for each samples
+scores <- sapply(program_panels, function(nm) {
+   colMeans(z[panels[[nm]], , drop = FALSE], na.rm = TRUE)
+})
+
+colnames(scores) <- program_panels
+
+
+# masculinization index: 
+# male-female program (1 axis, direct feminization test)
+scores <- cbind(scores,
+                masc_index = scores[, "1a_male_liver"] - scores[, "1b_female_liver"])
+
+```
+
+# A8: Bile acids
+
+This section links liver gene expression to serum bile-acid measurements from the same animals.
+
+The chunk below loads the bile-acid table, keeps the animals present in the RNA-seq data, harmonizes the diet label (`STD` → `SD`), and reorders the rows to match the sample metadata. 
+
+```{r}
+bile_acids <- read.xlsx("../../Docs/bile acids_76.xlsx") %>%
+  dplyr::filter(ID %in% sample_metadata$MID) %>%
+  dplyr::mutate(MID=ID,
+                Diet=ifelse(diet=="STD","SD",diet)) 
+
+# check 
+bile_acids <- bile_acids %>% column_to_rownames("MID")
+bile_acids <- bile_acids[as.character(sample_metadata$MID),]
+all(bile_acids$sex == sample_metadata$Sex)
+all(bile_acids$Diet == sample_metadata$Diet)
+
+bile_acids <- bile_acids %>% rownames_to_column("MID") %>%
+  dplyr::select(MID,CA:gLCA)
+
+```
+
+**Calculations**:
+
+- **total_pool**: the sum of seven measured species (tCA, taMCA, tbMCA, CA, aMCA, bMCA, LCA). It is not the full bile-acid pool: other species in the table (e.g. DCA, CDCA, UDCA, ωMCA and their conjugates) are not included. It pairs with Cyp7a1, the enzyme catalyzing the rate-limiting first step of bile-acid synthesis, so higher Cyp7a1 would be expected to go with a larger pool.
+
+- **index_12a**: a 12α-hydroxylation index, tCA / (taMCA + tbMCA). Cyp8b1 adds the 12α-hydroxyl group that turns the bile-acid precursor into cholic acid instead of muricholic acids, so a **positive** correlation between liver Cyp8b1 mRNA and this serum ratio would indicate that the two layers agree. The index is a simplified proxy: it uses only taurine-conjugated CA and leaves out unconjugated CA and DCA (also 12α-hydroxylated). Animals with tCA = 0 (probably below the detection limit) get an index of exactly 0.
+
+```{r}
+## derived quantities
+bile_acids <- bile_acids %>%
+  mutate(
+    total_pool = rowSums(across(c(tCA, taMCA, tbMCA, CA, aMCA, bMCA, LCA)), 
+                         na.rm = TRUE),
+    index_12a  = tCA / (taMCA + tbMCA),          # 12α index
+    muricholic = taMCA + tbMCA                    # for Cyp2c70
+  )
+
+## pull the enzyme genes from VST matrix (m), keyed to samples
+enzyme_syms <- c("Cyp8b1", "Cyp7a1", "Cyp2c70")
+enzyme_ids  <- sym$gene_id[match(enzyme_syms, sym$gene_name)]
+
+names(enzyme_ids) <- enzyme_syms
+all(enzyme_ids %in% rownames(m))
+
+enzyme_expr <- t(m[enzyme_ids, , drop = FALSE])
+colnames(enzyme_expr) <- enzyme_syms
+enzyme_df <- as.data.frame(enzyme_expr) %>%
+  rownames_to_column("SampleIAB")
+
+## join expression + serum + group (inner join keeps the 44 matched animals)
+dat <- cd %>%
+  dplyr::select(SampleIAB, MID, Group, Diet, Sex) %>%
+  dplyr::mutate(MID = as.character(MID)) %>%          # double -> character
+  inner_join(enzyme_df, by = "SampleIAB") %>%
+  inner_join(bile_acids %>% dplyr::mutate(MID = as.character(MID)),
+             by = "MID")
+
+cat("Animals with both layers:", nrow(dat), "\n") 
+```
+
+### Correlations
+
+Each enzyme is correlated with its matching bile-acid readout using Spearman's rank correlation, which is robust to outliers and does not assume a linear relationship. Two versions are computed:
+
+- **Overall**: across all animals. This can be driven by differences between groups (e.g. if one group is high in both).
+- **Within-group**: each variable is first centered within its group (the group mean is subtracted), and the centered values are correlated. This removes group differences and asks whether animals that are higher than their group average in one layer are also higher in the other. A within-group correlation is stronger evidence of a genuine per-animal link.
+
+```{r}
+#  ENZYME-METABOLITE Spearman correlations across all animals and within-group 
+
+# helper: within-group centering (subtract each group's mean)
+center_within <- function(x, grp) x - ave(x, grp, FUN = function(v) mean(v, na.rm = TRUE))
+
+cor_pair <- function(dat, expr_col, metab_col, label) {
+  x <- dat[[expr_col]]; y <- dat[[metab_col]]; g <- dat$Group
+  ok <- is.finite(x) & is.finite(y)
+
+  # overall
+  ov <- suppressWarnings(cor.test(x[ok], y[ok], method = "spearman"))
+  
+  # within-group: center both, then correlate
+  xc <- center_within(x, g); yc <- center_within(y, g)
+  ok2 <- is.finite(xc) & is.finite(yc)
+  wi <- suppressWarnings(cor.test(xc[ok2], yc[ok2], method = "spearman"))
+
+  data.frame(
+    pair          = label,
+    rho_overall   = unname(ov$estimate), p_overall   = ov$p.value,
+    rho_within    = unname(wi$estimate), p_within    = wi$p.value,
+    n             = sum(ok)
+  )
+}
+
+cor_tab <- bind_rows(
+  cor_pair(dat, "Cyp8b1",  "index_12a",  "Cyp8b1 ~ 12a-index"), # main 
+  cor_pair(dat, "Cyp7a1",  "total_pool", "Cyp7a1 ~ total pool"),# supplementary
+  cor_pair(dat, "Cyp2c70", "muricholic", "Cyp2c70 ~ taMCA+tbMCA"),
+  cor_pair(dat, "Cyp8b1", "muricholic", "Cyp8b1 ~ taMCA+tbMCA")   
+)
+
+cor_tab %>% kable(
+    caption = "Correlations",
+    digits  = 8,
+    booktabs = TRUE,
+    align = "llcccccc"
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position"),               
+    bootstrap_options = c("striped", "hover", "condensed")  
+  )    
+```
+
+```{r, fig.height=10,fig.width=10}
+# SCATTER plots, coloured by group
+scatter_pair <- function(dat, expr_col, metab_col, xlab, ylab, ttl) {
+  ggplot(dat, aes(.data[[expr_col]], .data[[metab_col]], colour = Group)) +
+    geom_point(size = 2, alpha = 0.8) +
+    geom_smooth(method = "lm", se = FALSE, colour = "grey40",
+                linewidth = 0.5, linetype = "dashed") +   # overall trend
+    labs(x = xlab, y = ylab, title = ttl) +
+    theme_bw() + 
+    scale_color_manual(values=group_colours)
+}
+
+p_main <- scatter_pair(dat, "Cyp8b1", "index_12a",
+                       "Cyp8b1 (VST)", "12α index  tCA/(taMCA+tbMCA)",
+                       "Main: Cyp8b1 vs 12α index")
+p_s1   <- scatter_pair(dat, "Cyp7a1", "total_pool",
+                       "Cyp7a1 (VST)", "Total BA pool", "Cyp7a1 vs total pool")
+p_s2   <- scatter_pair(dat, "Cyp2c70", "muricholic",
+                       "Cyp2c70 (VST)", "taMCA + tbMCA", "Cyp2c70 vs muricholic")
+p_s3   <- scatter_pair(dat, "Cyp8b1", "muricholic",
+                       "Cyp8b1 (VST)", "taMCA + tbMCA", "Cyp8b1 vs muricholic")
+
+((p_main | p_s1) / (p_s2 | p_s3)) + plot_layout(guides = "collect")
+```
+
+```{r}
+# helpers for inline numbers
+cv <- function(pair, col, d = 2) signif(cor_tab[cor_tab$pair == pair, col], d)
+
+# animals at the detection floor (tCA = 0 -> index_12a = 0)
+n_zero    <- sum(dat$index_12a == 0, na.rm = TRUE)
+n_zero_gm <- sum(dat$index_12a == 0 & dat$Group == "GFD_M", na.rm = TRUE)
+
+# sensitivity: Cyp8b1 ~ 12a-index without the zero-index animals
+nz      <- is.finite(dat$index_12a) & dat$index_12a > 0
+cor_nz  <- suppressWarnings(cor.test(dat$Cyp8b1[nz], dat$index_12a[nz], method = "spearman"))
+cor_nz
+
+# group means of Cyp8b1 and the 12a-index
+grp_ba <- aggregate(cbind(Cyp8b1, index_12a) ~ Group, data = dat, FUN = mean)
+grp_ba
+```
+
+::: {.callout-note title="Interpretation"}
+
+**Cyp8b1 vs 12α-index.** The correlation is **negative** (overall rho = `r cv("Cyp8b1 ~ 12a-index", "rho_overall")`, p = `r cv("Cyp8b1 ~ 12a-index", "p_overall")`; within-group rho = `r cv("Cyp8b1 ~ 12a-index", "rho_within")`, p = `r cv("Cyp8b1 ~ 12a-index", "p_within")`). This is the opposite of the direct enzyme–product relationship described above, so it does not confirm it. Two explanations are plausible:
+
+- **Feedback:** low serum CA means weaker FXR activation, which releases the repression of Cyp8b1.
+- **Detection floor:** `r n_zero` animals (`r n_zero_gm` of them GFD males) have a 12α-index of exactly 0, and they sit at high Cyp8b1. Without them, rho = `r signif(unname(cor_nz$estimate), 2)` (p = `r signif(cor_nz$p.value, 2)`).
+
+**Cyp7a1 vs total pool.** No significant correlation (rho = `r cv("Cyp7a1 ~ total pool", "rho_overall")`, p = `r cv("Cyp7a1 ~ total pool", "p_overall")`), so the expected link is not seen in these data.
+
+**Cyp2c70 and Cyp8b1 vs muricholic acids.** Both overall correlations are significant (Cyp2c70 rho = `r cv("Cyp2c70 ~ taMCA+tbMCA", "rho_overall")`, Cyp8b1 rho = `r cv("Cyp8b1 ~ taMCA+tbMCA", "rho_overall")`) but neither holds within groups (p = `r cv("Cyp2c70 ~ taMCA+tbMCA", "p_within")` and `r cv("Cyp8b1 ~ taMCA+tbMCA", "p_within")`), so they reflect differences between groups rather than a per-animal link.
+
+:::
+
+### PCA
+
+Are GFD males outliers in the narrow BA-metabolism panel,
+independently of the global (thousands-of-genes) structure?
+
+A PCA is run on the cholestasis/bile-acid panel (panel 8) alone, using all of its 15 genes; none of them belong to the sex-specific liver panels. The panel genes are z-scored across samples; since they are already centered and scaled, `prcomp()` is run without further centering or scaling. The plot shows each animal on PC1 and PC2 of this small gene set, with an ellipse per group summarizing where most of the group's animals lie.
+
+```{r}
+# PCA on PANEL 8 ONLY
+panel8_ids <- intersect(panels[["8_cholestasis"]], rownames(m))   # present only
+
+cat("Panel-8 genes used:", length(panel8_ids), "\n")
+
+## panel-8 expression matrix, genes z-scored across samples
+m8 <- m[panel8_ids, , drop = FALSE]
+z8 <- t(scale(t(m8)))                                  
+z8 <- z8[, cd$SampleIAB, drop = FALSE]                
+
+##PCA on panel 8 
+pca8 <- prcomp(t(z8), center = FALSE, scale. = FALSE)
+pv8  <- round(100 * pca8$sdev^2 / sum(pca8$sdev^2), 1)
+
+pca8_df <- as.data.frame(pca8$x[, 1:2]) %>%
+  mutate(Group = cd$Group, 
+         Sex = cd$Sex, 
+         Diet = cd$Diet)
+
+p_pca8 <- ggplot(pca8_df, 
+                 aes(PC1, PC2, colour = Group, shape = Sex)) +
+  geom_point(size = 2.5, alpha = 0.85) +
+  stat_ellipse(aes(group = Group), type = "norm", linewidth = 0.4) +
+  labs(x = paste0("PC1: ", pv8[1], "%"), y = paste0("PC2: ", pv8[2], "%"),
+       title = "PCA: panel 8 (cholestasis panel) only") +
+  theme_bw() + 
+  scale_color_manual(values = group_colours)
+
+p_pca8
+```
+
+## PERMANOVA
+
+```{r}
+# same scale as the PCA above: z-scored panel-8 genes
+mat   <- z8 %>% t()
+cd <- as.data.frame(colData(dds))
+
+# align metadata to the expression matrix
+meta  <- cd[match(rownames(mat), cd$SampleIAB), ]      
+nrow(meta) == nrow(mat)
+
+d <- dist(mat) # Euclidean on z-scored VST
+
+# Dispersion homogeneity 
+bd <- betadisper(d, meta$Group)
+
+# if significant -> groups differ in SPREAD, PERMANOVA may be  invalid
+anova(bd) %>% kable(
+    caption = "Results for test of dispersion homogeneity",
+    digits  = 8,
+    booktabs = TRUE,
+    align = "llcccccc"
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position"),               
+    bootstrap_options = c("striped", "hover", "condensed")  
+  )    
+
+boxplot(bd)             # visualize per-group spread
+
+set.seed(123)
+pmv8 <- adonis2(d ~ Diet * Sex,
+               data = meta,
+               strata = meta$Date,
+               by = "terms", # sequential; tests each term in order
+               permutations = 9999)
+
+pmv8 %>%    kable(
+    caption = "PERMANOVA result (panel 8, date-stratified)",
+    digits  = 8,
+    booktabs = TRUE,
+    align = "llcccccc"
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position"),               
+    bootstrap_options = c("striped", "hover", "condensed")  
+  )    
+```
+
+::: {.callout-note title="Interpretation"}
+
+On the bile-acid panel alone, Sex (R² = `r round(100 * pmv8["Sex", "R2"])`%, p = `r pmv8["Sex", "Pr(>F)"]`) and Diet (R² = `r round(100 * pmv8["Diet", "R2"])`%, p = `r pmv8["Diet", "Pr(>F)"]`) both shift the profile, and the Diet×Sex interaction is small (R² = `r round(100 * pmv8["Diet:Sex", "R2"], 1)`%, p = `r pmv8["Diet:Sex", "Pr(>F)"]`). In the PCA, GFD males are **shifted** along PC1 but their ellipse still overlaps the SD groups, so they are displaced rather than fully separated.
+
+:::
+
+```{r}
+save(pmv8,p_pca8,file = "../Results/figures/FS5.RData")
+```
+
+# B2: Phenotype
+
+**Clinical liver-function markers**
+
+This section asks whether the transcriptomic results relate to clinical and physiological readouts.
+
+The chunk below loads the clinical parameters (serum liver markers and other measurements) and merges them with a freshly re-read copy of the sample metadata.
+
+```{r}
+params <- read.xlsx("../../Data/P076_3_params.xlsx") %>%
+  dplyr::filter(MID %in% sample_metadata$MID) 
+
+# load metadata
+sample_metadata <- read.xlsx("../../Data/metadata_P076v3.xlsx",detectDates = TRUE) %>%
+  dplyr::filter(!is.na(SampleIAB)) %>%
+  dplyr::mutate(Group=paste(Diet,Sex,sep = "_")) %>% 
+  dplyr::mutate(SampleID=SampleIAB)
+
+sample_metadata <- merge(sample_metadata,params,by="MID",all=TRUE)
+
+# merge() renames Date to Date.x if the params table also has a Date column
+if (!"Date" %in% names(sample_metadata) && "Date.x" %in% names(sample_metadata))
+  sample_metadata$Date <- sample_metadata$Date.x
+
+# same reference levels as the rest of the report (SD, F)
+sample_metadata <- sample_metadata %>%
+  mutate(Diet = factor(Diet, levels = c("SD", "GFD")),
+         Sex  = factor(Sex,  levels = c("F", "M")),
+         Date = factor(gsub("-", "_", Date)))
+```
+
+A PCA of the whole transcriptome is recomputed (the 2,000 most variable genes on the VST scale) to obtain each animal's PC1 and PC2 coordinates. These are merged in one table (`pc_full`) with:
+
+- the bile-acid quantities (from A8),
+- the clinical parameters.
+
+```{r}
+## Get PC1/PC2 per animal from the global VST PCA
+vsd_mat <- assay(vsd)                       # or m
+
+rv    <- matrixStats::rowVars(vsd_mat)
+top   <- order(rv, decreasing = TRUE)[seq_len(min(2000, length(rv)))]
+pca   <- prcomp(t(vsd_mat[top, ]), scale. = FALSE)
+pv    <- round(100 * pca$sdev^2 / sum(pca$sdev^2), 1)
+
+pc_df <- as.data.frame(pca$x[, 1:2]) %>%
+  rownames_to_column("SampleIAB") %>%
+  left_join(cd %>% as.data.frame() %>%
+              dplyr::select(SampleIAB, MID, Group, Diet, Sex),
+            by = "SampleIAB")
+
+# phenotype table
+pheno <- sample_metadata 
+
+# bile-acid derived indices from A8 (dat has SampleIAB + MID + indices)
+ba_df <- dat %>%
+  dplyr::select(SampleIAB, MID, total_pool, index_12a, muricholic)
+
+## merge everything onto the PC table
+pc_full <- pc_df %>% dplyr::select(-Diet,-Sex) %>%
+  mutate(MID = as.character(MID)) %>%
+  left_join(ba_df %>% mutate(MID = as.character(MID)) %>%
+              dplyr::select(-SampleIAB), by = "MID") %>%
+  left_join(pheno %>% mutate(MID = as.character(MID)) %>%
+              dplyr::select(-SampleIAB,-Group), by = "MID")
+
+```
+
+```{r}
+# Correlate PC1 & PC2 with every phenotype (overall + within-group)
+pheno_vars <- intersect(
+  c("AST","ALT","AlkP2","BiliT","total_pool","index_12a","muricholic"),
+  colnames(pc_full))
+
+center_within <- function(x, grp) x - ave(x, grp, FUN = function(v) mean(v, na.rm = TRUE))
+
+cor_pc <- lapply(c("PC1","PC2"), function(pc){
+  lapply(pheno_vars, function(v){
+    x <- pc_full[[pc]]; 
+    y <- pc_full[[v]]; 
+    g <- pc_full$Group
+    
+    ok <- is.finite(x) & is.finite(y)
+    if (sum(ok) < 4) return(NULL)
+    ov <- suppressWarnings(cor.test(x[ok], y[ok], method = "spearman"))
+    xc <- center_within(x, g); yc <- center_within(y, g)
+    ok2 <- is.finite(xc) & is.finite(yc)
+    wi <- suppressWarnings(cor.test(xc[ok2], yc[ok2], method = "spearman"))
+    data.frame(PC = pc, phenotype = v,
+               rho_overall = unname(ov$estimate), p_overall = ov$p.value,
+               rho_within  = unname(wi$estimate), p_within  = wi$p.value,
+               n = sum(ok))
+  }) %>% bind_rows()
+}) %>% bind_rows()
+
+# BH correction within each PC
+cor_pc <- cor_pc %>%
+  group_by(PC) %>%
+  mutate(padj_overall = p.adjust(p_overall, "BH")) %>%
+  ungroup() %>%
+  arrange(PC, p_overall)
+
+cor_pc %>% kable(
+    caption = "Correlations",
+    digits  = 8,
+    booktabs = TRUE,
+    align = "llcccccc"
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position"),               
+    bootstrap_options = c("striped", "hover", "condensed")  
+  )    
+```
+
+Several phenotypes correlate with PC1 across all animals, but none of these correlations hold within groups (all `rho_within` close to 0). They reflect differences between the groups, not a per-animal link between the transcriptome and the phenotype.
+
+```{r}
+p1 <- ggplot(pc_full, aes(PC1, AlkP2, colour = Group)) +
+    geom_point(size = 2, alpha = 0.8) +
+    geom_smooth(method = "lm", se = FALSE, colour = "grey40",
+                linewidth = 0.5, linetype = "dashed") +   # overall trend
+    labs(x = "PC1", y = "AlkP2", title = "PC1~AlkP2") +
+    theme_bw() + 
+    scale_color_manual(values=group_colours)
+
+p2 <- ggplot(pc_full, aes(PC1, as.numeric(AST), colour = Group)) +
+    geom_point(size = 2, alpha = 0.8) +
+    geom_smooth(method = "lm", se = FALSE, colour = "grey40",
+                linewidth = 0.5, linetype = "dashed") +   # overall trend
+    labs(x = "PC1", y = "AST", title = "PC1~AST") +
+    theme_bw() + 
+    scale_color_manual(values=group_colours)
+
+p3 <- ggplot(pc_full, aes(PC1, ALT, colour = Group)) +
+    geom_point(size = 2, alpha = 0.8) +
+    geom_smooth(method = "lm", se = FALSE, colour = "grey40",
+                linewidth = 0.5, linetype = "dashed") +   # overall trend
+    labs(x = "PC1", y = "ALT", title = "PC1~ALT") +
+    theme_bw() + 
+    scale_color_manual(values=group_colours)
+
+p4 <- ggplot(pc_full, aes(PC1, BiliT, colour = Group)) +
+    geom_point(size = 2, alpha = 0.8) +
+    geom_smooth(method = "lm", se = FALSE, colour = "grey40",
+                linewidth = 0.5, linetype = "dashed") +   # overall trend
+    labs(x = "PC1", y = "BiliT", title = "PC1~BiliT") +
+    theme_bw() + 
+    scale_color_manual(values=group_colours)
+
+p1 + p2 + p3 + p4
+```
+
+## Group-means
+
+```{r}
+params <- read.xlsx("../../Data/P076_3_params.xlsx") %>%
+  dplyr::filter(MID %in% sample_metadata$MID) 
+
+# load metadata
+sample_metadata <- read.xlsx("../../Data/metadata_P076v3.xlsx",detectDates = TRUE) %>%
+  dplyr::filter(!is.na(SampleIAB)) %>%
+  dplyr::mutate(Group=paste(Diet,Sex,sep = "_")) %>% 
+  dplyr::mutate(SampleID=SampleIAB)
+
+sample_metadata <- merge(sample_metadata,params,by="MID",all=TRUE)
+
+# merge() renames Date to Date.x if the params table also has a Date column
+if (!"Date" %in% names(sample_metadata) && "Date.x" %in% names(sample_metadata))
+  sample_metadata$Date <- sample_metadata$Date.x
+
+# same reference levels as the rest of the report (SD, F)
+sample_metadata <- sample_metadata %>%
+  mutate(Diet = factor(Diet, levels = c("SD", "GFD")),
+         Sex  = factor(Sex,  levels = c("F", "M")),
+         Date = factor(gsub("-", "_", Date)))
+```
+
+```{r}
+liver_markers <- c("AST","ALT","AlkP2","BiliT")
+
+sample_metadata[liver_markers] <- lapply(sample_metadata[liver_markers],
+                                       function(x) as.numeric(as.character(x)))
+
+# same model as the panel scores: marker ~ Diet * Sex + Date (SD and F as reference)
+marker_tab <- lapply(liver_markers, function(mk){
+  fit <- lm(sample_metadata[[mk]] ~ Diet * Sex + Date, data = sample_metadata)   
+  co  <- summary(fit)$coefficients
+  int <- grep(":", rownames(co), value = TRUE)[1]
+  data.frame(marker = mk,
+             Interaction_est = co[int,"Estimate"],
+             Interaction_p   = co[int,"Pr(>|t|)"])
+}) %>% dplyr::bind_rows()
+
+marker_tab$padj <- p.adjust(marker_tab$Interaction_p, "BH")
+
+marker_tab
+
+# diet effect (GFD vs SD) within each sex, BH-corrected across markers x sexes
+diet_tab <- lapply(liver_markers, function(mk){
+  fit <- lm(sample_metadata[[mk]] ~ Diet * Sex + Date, data = sample_metadata)
+  pw  <- as.data.frame(pairs(emmeans::emmeans(fit, ~ Diet | Sex), reverse = TRUE))
+  data.frame(marker = mk, Sex = pw$Sex, contrast = pw$contrast,
+             estimate = pw$estimate, p = pw$p.value)
+}) %>% dplyr::bind_rows()
+
+diet_tab$padj <- p.adjust(diet_tab$p, "BH")
+diet_tab
+
+# group means and medians — are GFD_M elevated (damage) or not?
+aggregate(cbind(AST, ALT, AlkP2, BiliT) ~ Group,
+          data = sample_metadata,
+          FUN = function(x) mean(x, na.rm = TRUE))
+
+aggregate(cbind(AST, ALT, AlkP2, BiliT) ~ Group,
+          data = sample_metadata,
+          FUN = function(x) median(x, na.rm = TRUE))
+
+# largest bilirubin value per group (outlier check)
+aggregate(BiliT ~ Group, data = sample_metadata, FUN = max)
+```
+
+```{r}
+# helpers for inline numbers
+mv <- function(mk, col, d = 2) signif(marker_tab[marker_tab$marker == mk, col], d)
+dv <- function(mk, sex, col = "padj", d = 2)
+  signif(diet_tab[diet_tab$marker == mk & diet_tab$Sex == sex, col], d)
+bili_max <- max(sample_metadata$BiliT[sample_metadata$Group == "SD_F"], na.rm = TRUE)
+```
+
+::: {.callout-note title="Interpretation"}
+
+**Interaction.** No clinical liver marker (AST, ALT, AlkP2, total bilirubin) shows a Diet×Sex interaction that survives multiple-testing correction. The lowest is AlkP2 (est = `r mv("AlkP2", "Interaction_est")`, p = `r mv("AlkP2", "Interaction_p")`, padj = `r mv("AlkP2", "padj")`). With SD and F as reference, a negative estimate means GFD lowers AlkP2 more in males than in females.
+
+**Diet effect.** The group means show a clear pattern that the interaction test does not capture: **GFD males have the lowest AST, ALT and AlkP2** of all groups, and GFD lowers these markers in both sexes. GFD vs SD within males: AST padj = `r dv("AST", "M")`, ALT padj = `r dv("ALT", "M")`, AlkP2 padj = `r dv("AlkP2", "M")`. So the diet does show up in serum markers, mainly as lower liver-enzyme levels; what is not detectable at this n is a *sex-specific* difference in that effect.
+
+**Bilirubin.** The SD_F mean is inflated by a single animal (BiliT = `r bili_max`); the medians are a better summary for this marker.
+:::
+
+# Functional enrichment - Interaction genes
+
+## Hallmark
+
+```{r}
+library(fgsea); library(msigdbr)
+
+# rank by the Wald statistic of the unshrunk interaction test:
+# shrunk LFCs put thousands of genes at ~0 (ties), which weakens GSEA
+res_int_raw <- results(dds, name = "DietGFD.SexM")
+
+res_int_df <- as.data.frame(res_int_raw) %>%
+  rownames_to_column("gene_id") %>%
+  left_join(sym, by = "gene_id")
+
+# one value per gene symbol (keep the strongest), ranked by the statistic
+ranks <- res_int_df %>%
+  dplyr::filter(!is.na(gene_name) & gene_name != "" & !is.na(stat)) %>% 
+  dplyr::group_by(gene_name) %>%
+  dplyr::slice_max(abs(stat), n = 1, with_ties = FALSE) %>%
+  dplyr::ungroup() %>%
+  dplyr::arrange(desc(stat)) %>%
+  { setNames(.$stat, .$gene_name) }
+
+# mouse Hallmark gene sets (KEGG + Reactome below)
+msig <- tryCatch(msigdbr(species = "Mus musculus", collection = "H"),   # Hallmark
+                 error = function(e) msigdbr(species = "Mus musculus", category = "H"))
+pathways <- split(msig$gene_symbol, msig$gs_name)
+
+fgsea_res <- fgsea(pathways, ranks, minSize = 10, maxSize = 500, eps = 0)
+
+fgsea_res %>% 
+  dplyr::filter(padj<0.05) %>%
+  dplyr::arrange(desc(abs(NES))) %>% 
+  kable(
+    caption = "Hallmark gene set significant pathways",
+    digits  = 8,
+    booktabs = TRUE,
+    align = "llcccccc"
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position"),               
+    bootstrap_options = c("striped", "hover", "condensed")  
+  )   
+```
+Saving the result
+
+```{r}
+hallmark_int <- fgsea_res
+write.xlsx(fgsea_res,"../Results/fe_hallmark.xlsx",rownames=FALSE)
+```
+
+## KEGG & REACTOME
+
+The same GSEA is run with two larger, more detailed collections:
+
+- **KEGG** (legacy MSigDB version): curated metabolic and signaling pathway maps.
+- **Reactome**: pathways curated at the level of individual reactions, organized in a hierarchy from broad to narrow processes.
+
+The helper `get_sets()` downloads the gene sets and works with both the newer and older `msigdbr` interfaces. Sets with 5–500 genes are tested; the tables show sets with padj < 0.05, sorted by |NES|. `set.seed()` makes the permutation-based p-values reproducible.
+
+```{r}
+# Pull KEGG + Reactome gene sets (mouse)
+get_sets <- function(coll, subcoll) {
+  out <- tryCatch(
+    msigdbr(species = "Mus musculus", collection = coll, subcollection = subcoll),
+    error = function(e)
+      msigdbr(species = "Mus musculus", category = coll, subcategory = subcoll)
+  )
+  split(out$gene_symbol, out$gs_name)
+}
+
+kegg     <- tryCatch(get_sets("C2", "CP:KEGG_LEGACY"), error = function(e) get_sets("C2","CP:KEGG"))
+reactome <- get_sets("C2", "CP:REACTOME")
+
+#  Run fgsea on each collection
+set.seed(123)
+kegg_res <- fgsea(kegg, ranks, minSize = 5, maxSize = 500, eps = 0) 
+
+react_res <- fgsea(reactome, ranks, minSize = 5, maxSize = 500, eps = 0) 
+
+```
+
+```{r}
+kegg_res %>% 
+  dplyr::filter(padj<0.05) %>%
+  dplyr::arrange(desc(abs(NES))) %>% 
+  kable(
+    caption = "KEGG db significant pathways",
+    digits  = 8,
+    booktabs = TRUE,
+    align = "llcccccc"
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position"),               
+    bootstrap_options = c("striped", "hover", "condensed")  
+  )   
+```
+Saving results.
+
+```{r}
+write.xlsx(kegg_res,"../Results/fe_kegg.xlsx",rownames=FALSE)
+
+```
+
+```{r}
+react_res %>% 
+  dplyr::filter(padj<0.05) %>%
+  dplyr::arrange(desc(abs(NES))) %>% 
+  kable(
+    caption = "Reactome db significant pathways",
+    digits  = 8,
+    booktabs = TRUE,
+    align = "llcccccc"
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position"),               
+    bootstrap_options = c("striped", "hover", "condensed")  
+  )   
+```
+Saving the results
+
+```{r}
+write.xlsx(react_res,"../Results/fe_reactome.xlsx",rownames=FALSE)
+```
+
+
+## Specific pathway-focused
+
+```{R}
+# Focus on bile-acid / lipid / sterol pathways
+focus <- "BILE|CHOLESTEROL|STEROL|STEROID|FATTY_ACID|LIPID|PPAR|OXIDATION|MITOCHOND|OXIDATIVE_PHOS|TRIGLYCERIDE|LIPOGEN"
+
+kegg_focus <- kegg_res %>% dplyr::filter(grepl(focus, pathway, ignore.case = TRUE))
+react_focus <- react_res %>% dplyr::filter(grepl(focus, pathway, ignore.case = TRUE))
+
+cat("KEGG: metabolic pathways\n")
+kegg_focus %>% dplyr::select(pathway, pval, padj, NES, size)  %>%
+  dplyr::arrange(desc(abs(NES))) %>% 
+  kable(
+    caption = "KEGG db selected pathways",
+    digits  = 8,
+    booktabs = TRUE,
+    align = "llcccccc"
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position"),               
+    bootstrap_options = c("striped", "hover", "condensed")  
+  )   
+
+cat("Reactome: metabolic pathways\n")
+react_focus %>% dplyr::select(pathway, pval, padj, NES, size) %>%
+  dplyr::arrange(desc(abs(NES))) %>% 
+  kable(
+    caption = "Reactome db selected pathways",
+    digits  = 8,
+    booktabs = TRUE,
+    align = "llcccccc"
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position"),               
+    bootstrap_options = c("striped", "hover", "condensed")  
+)
+```
+
+# Functional enrichment - Diet effect in males genes
+
+## Hallmark
+
+```{r}
+library(fgsea); library(msigdbr)
+
+# rank by the Wald statistic of the unshrunk diet-in-males contrast
+res_M_raw <- results(dds, contrast = list(c("Diet_GFD_vs_SD", "DietGFD.SexM")))
+
+res_M_df <- as.data.frame(res_M_raw) %>%
+  rownames_to_column("gene_id") %>%
+  left_join(sym, by = "gene_id")
+
+# one value per gene symbol (keep the strongest), ranked by the statistic
+ranks <- res_M_df %>%
+  dplyr::filter(!is.na(gene_name) & gene_name != "" & !is.na(stat)) %>% 
+  dplyr::group_by(gene_name) %>%
+  dplyr::slice_max(abs(stat), n = 1, with_ties = FALSE) %>%
+  dplyr::ungroup() %>%
+  dplyr::arrange(desc(stat)) %>%
+  { setNames(.$stat, .$gene_name) }
+
+# mouse Hallmark gene sets (KEGG + Reactome below)
+msig <- tryCatch(msigdbr(species = "Mus musculus", collection = "H"),   # Hallmark
+                 error = function(e) msigdbr(species = "Mus musculus", category = "H"))
+pathways <- split(msig$gene_symbol, msig$gs_name)
+
+fgsea_res <- fgsea(pathways, ranks, minSize = 10, maxSize = 500, eps = 0)
+
+fgsea_res %>% 
+  dplyr::filter(padj<0.05) %>%
+  dplyr::arrange(desc(abs(NES))) %>% 
+  kable(
+    caption = "Hallmark gene set significant pathways",
+    digits  = 8,
+    booktabs = TRUE,
+    align = "llcccccc"
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position"),               
+    bootstrap_options = c("striped", "hover", "condensed")  
+  )   
+```
+Saving the result
+
+```{r}
+hallmark_M <- fgsea_res
+write.xlsx(fgsea_res,"../Results/fe_hallmark_males.xlsx",rownames=FALSE)
+```
+
+## KEGG & REACTOME
+
+The same GSEA is run with two larger, more detailed collections:
+
+- **KEGG** (legacy MSigDB version): curated metabolic and signaling pathway maps.
+- **Reactome**: pathways curated at the level of individual reactions, organized in a hierarchy from broad to narrow processes.
+
+The helper `get_sets()` downloads the gene sets and works with both the newer and older `msigdbr` interfaces. Sets with 5–500 genes are tested; the tables show sets with padj < 0.05, sorted by |NES|. `set.seed()` makes the permutation-based p-values reproducible.
+
+```{r}
+# Pull KEGG + Reactome gene sets (mouse)
+get_sets <- function(coll, subcoll) {
+  out <- tryCatch(
+    msigdbr(species = "Mus musculus", collection = coll, subcollection = subcoll),
+    error = function(e)
+      msigdbr(species = "Mus musculus", category = coll, subcategory = subcoll)
+  )
+  split(out$gene_symbol, out$gs_name)
+}
+
+kegg     <- tryCatch(get_sets("C2", "CP:KEGG_LEGACY"), error = function(e) get_sets("C2","CP:KEGG"))
+reactome <- get_sets("C2", "CP:REACTOME")
+
+#  Run fgsea on each collection
+set.seed(123)
+kegg_res <- fgsea(kegg, ranks, minSize = 5, maxSize = 500, eps = 0) 
+
+react_res <- fgsea(reactome, ranks, minSize = 5, maxSize = 500, eps = 0) 
+
+```
+
+```{r}
+kegg_res %>% 
+  dplyr::filter(padj<0.05) %>%
+  dplyr::arrange(desc(abs(NES))) %>% 
+  kable(
+    caption = "KEGG db significant pathways",
+    digits  = 8,
+    booktabs = TRUE,
+    align = "llcccccc"
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position"),               
+    bootstrap_options = c("striped", "hover", "condensed")  
+  )   
+```
+
+Saving results.
+
+```{r}
+kegg_M <- kegg_res
+write.xlsx(kegg_res,"../Results/fe_kegg_males.xlsx",rownames=FALSE)
+
+```
+
+```{r}
+react_res %>% 
+  dplyr::filter(padj<0.05) %>%
+  dplyr::arrange(desc(abs(NES))) %>% 
+  kable(
+    caption = "Reactome db significant pathways",
+    digits  = 8,
+    booktabs = TRUE,
+    align = "llcccccc"
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position"),               
+    bootstrap_options = c("striped", "hover", "condensed")  
+  )   
+```
+
+Saving the results
+
+```{r}
+write.xlsx(react_res,"../Results/fe_reactome_males.xlsx",rownames=FALSE)
+```
+
+# Quick summary
+
+```{r}
+# values for the summary
+nes <- function(tab, pw) signif(tab$NES[tab$pathway == pw], 2)
+pad <- function(tab, pw) signif(tab$padj[tab$pathway == pw], 2)
+updown <- function(x) ifelse(x > 0, "up", "down")
+oxphos_M  <- nes(hallmark_M, "HALLMARK_OXIDATIVE_PHOSPHORYLATION")
+oxphos_K  <- nes(kegg_M, "KEGG_OXIDATIVE_PHOSPHORYLATION")
+chol_M    <- nes(hallmark_M, "HALLMARK_CHOLESTEROL_HOMEOSTASIS")
+top_cyp8b1 <- grp_ba$Group[which.max(grp_ba$Cyp8b1)]
+low_12a    <- grp_ba$Group[which.min(grp_ba$index_12a)]
+```
+
+**GFD males have a distinct bile-acid profile**
+
+`r top_cyp8b1` has the highest liver Cyp8b1 and `r low_12a` the lowest serum 12α-index. Across animals, Cyp8b1 and the 12α-index are **negatively** correlated (overall rho = `r cv("Cyp8b1 ~ 12a-index", "rho_overall")`; within-group rho = `r cv("Cyp8b1 ~ 12a-index", "rho_within")`, p = `r cv("Cyp8b1 ~ 12a-index", "p_within")`). This is the opposite of a direct enzyme–product link and is more consistent with feedback regulation, partly driven by animals at the detection floor (12α-index = 0). On the bile-acid gene panel alone, GFD males are shifted along PC1 but overlap the SD groups (interaction R² = `r round(100 * pmv8["Diet:Sex", "R2"], 1)`%, p = `r pmv8["Diet:Sex", "Pr(>F)"]`).
+
+**Diet drives a male-specific metabolic switch**
+
+In males, GFD shifts oxidative phosphorylation `r updown(oxphos_M)` (Hallmark NES = `r oxphos_M`, padj = `r pad(hallmark_M, "HALLMARK_OXIDATIVE_PHOSPHORYLATION")`; KEGG NES = `r oxphos_K`) and cholesterol homeostasis `r updown(chol_M)` (Hallmark NES = `r chol_M`, padj = `r pad(hallmark_M, "HALLMARK_CHOLESTEROL_HOMEOSTASIS")`), consistent with the lower lipogenesis panel score in GFD males (part 2).
+
+**Serum markers**
+
+GFD lowers AST, ALT and AlkP2, most clearly in males, but no marker shows a significant Diet×Sex interaction.
+
+**Main caveat: collection order**
+
+Oxidative phosphorylation, ribosome and translation signatures in liver also change with feeding state and time of day, and GFD males were always collected last. Part of the male-specific response may reflect time of collection rather than diet.
+
