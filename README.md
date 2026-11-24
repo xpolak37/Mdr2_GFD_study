@@ -79,7 +79,7 @@ The code for transcriptomics with reported results can be found:
 - [P76_3_part1](https://xpolak37.github.io/Mdr2_GFD_study/rnaseq/rnaseq_P76_3_part1.html): data import, quality control (detected genes, sequencing depth) and exploratory analysis
 - [P76_3_part2](https://xpolak37.github.io/Mdr2_GFD_study/rnaseq/rnaseq_P76_3_part2.html): global structure (PCA, PERMANOVA, clustering), differential expression, collection-order checks and curated gene panels
 - [P76_3_part3](https://xpolak37.github.io/Mdr2_GFD_study/rnaseq/rnaseq_P76_3_part3.html): integration with serum bile acids and clinical liver markers, and pathway enrichment (Hallmark, KEGG, Reactome)
-- [P76_4_validation](https://xpolak37.github.io/P/Mdr2_GFD_study/rnaseq/rnaseq_validation_P76_4.html): tests whether the main P76_3 findings replicate in the independent P76_4 cohort
+- [P76_4_validation](https://xpolak37.github.io/Mdr2_GFD_study/rnaseq/rnaseq_validation_P76_4.html): tests whether the main P76_3 findings replicate in the independent P76_4 cohort
 
 **Liver phenotype, immunology and microbiota**: the results of these analyses are reported in the manuscript. The R scripts that produce them are in [`phenotype_microbiome/R/`](phenotype_microbiome/R/), and the [`phenotype_microbiome/README.md`](phenotype_microbiome/README.md) explains how to run them.
 
